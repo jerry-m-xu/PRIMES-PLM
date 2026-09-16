@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""Local structural labels for TM-aligned protein pairs.
+
+For every protein pair in tm_scores.csv, sample residue pairs and score each
+with patch-level Gromov-Wasserstein (see fgw.py):
+
+  aligned   every ALIGNED_RESIDUE_STRIDE-th TM-align-aligned residue pair
+  shifted   the same residue of protein 1 matched SHIFT_RANGE residues away
+            along protein 2 (a hard negative: its patch overlaps the true one)
+  random    a uniformly random residue pair
+
+NEGATIVES_PER_POSITIVE off-path pairs are written per aligned pair,
+alternating shifted and random. Without them every label sits on TM-align's
+path and nothing teaches a model that non-corresponding residues are
+dissimilar.
+
+Each row also carries the TM-align superposed CA distance and the per-pair
+TM term 1 / (1 + (d / d0)^2). Unlike GW it is chirality-aware, and it
+separates "displaced but locally intact" from "locally different".
+"""
 
 import os
 import sys
@@ -11,12 +30,21 @@ from common import (
     embedding_path,
     log_failures,
     open_appending_writer,
+    parse_superposition,
     pdb_path,
     read_done_rows,
     write_progress,
     write_run_manifest,
 )
-from fgw import compute_fgw_from_features
+from fgw import (
+    ALPHA,
+    DIST_SCALE,
+    EPS,
+    INNER_ITER,
+    OUTER_ITER,
+    compute_fgw_from_features,
+    compute_structure_gw,
+)
 from parse_pdb import parse_pdb
 from patches import K_NEIGHBORS, knn_indices
 
@@ -32,31 +60,57 @@ END_ROW = 50000
 CSV_CHUNK_SIZE = 1000
 FLUSH_EVERY_ROWS = 10
 ALIGNED_RESIDUE_STRIDE = 32  # K_NEIGHBORS now comes from patches.py
-ALPHA = 0.7
-EPS = 0.05
-SINKHORN_ITER = 30
-STRUCTURE_EXP_SCALE = 0.1
+NEGATIVES_PER_POSITIVE = 1
+SHIFT_RANGE = (4, 32)  # |offset| along protein 2 for a "shifted" negative
+# solver settings (DIST_SCALE, EPS, ALPHA, iteration counts) live in fgw.py
 
+PAIR_TYPES = ("aligned", "shifted", "random")
 SEQM_VALUES = {":", ".", " "}
+REQUIRED_TM_COLUMNS = (
+    "id1", "id2", "tm_score_norm1", "tm_score_norm2",
+    "seqxA", "seqM", "seqyA", "superposition",
+)
 
 
-def compute_local_fgw(
+def compute_local_labels(
     coords1: np.ndarray,
     coords2: np.ndarray,
     features1: np.ndarray,
     features2: np.ndarray,
 ):
-    return compute_fgw_from_features(
+    """Raw distortions for one residue pair: (gw_raw, fgw_raw, fgw_feature_term).
+
+    gw_raw is the structure label's source: pure GW, features not consulted.
+    fgw_raw is the fused objective at its own coupling, kept as a secondary
+    score. Both are raw; pair_data.py maps them to exp(-raw / scale).
+    """
+    gw_raw = compute_structure_gw(
+        coords1, coords2, eps=EPS, outer_iter=OUTER_ITER, inner_iter=INNER_ITER
+    )
+    fgw_raw, _, feature_term = compute_fgw_from_features(
         coords1,
         coords2,
         features1,
         features2,
         alpha=ALPHA,
         eps=EPS,
-        sinkhorn_iter=SINKHORN_ITER,
-        structure_exp_scale=STRUCTURE_EXP_SCALE,
+        outer_iter=OUTER_ITER,
+        inner_iter=INNER_ITER,
         return_components=True,
     )
+    return float(gw_raw), float(fgw_raw), float(feature_term)
+
+
+def tm_d0(length):
+    """TM-align's distance scale for a normalising length."""
+    if length <= 21:
+        return 0.5
+    return max(0.5, 1.24 * (length - 15) ** (1.0 / 3.0) - 1.8)
+
+
+def tm_term(distance, d0):
+    """One residue pair's contribution to TM-score, in (0, 1]."""
+    return 1.0 / (1.0 + (distance / d0) ** 2)
 
 
 def iter_aligned_residue_pairs(seqxA: str, seqM: str, seqyA: str):
@@ -81,6 +135,53 @@ def iter_aligned_residue_pairs(seqxA: str, seqM: str, seqyA: str):
             continue
 
         yield align_pos, residue_idx1, residue_idx2, aa1, marker, aa2
+
+
+def shifted_pair(residue_idx1, residue_idx2, length2, rng):
+    """(i, j +/- shift), or None if the protein is too short for the shift."""
+    shift = int(rng.integers(SHIFT_RANGE[0], SHIFT_RANGE[1] + 1))
+    shift *= int(rng.choice((-1, 1)))
+    for candidate in (residue_idx2 + shift, residue_idx2 - shift):
+        if 0 <= candidate < length2:
+            return residue_idx1, candidate
+    return None
+
+
+def random_pair(length1, length2, on_path, rng):
+    pair = None
+    for _ in range(10):
+        pair = int(rng.integers(length1)), int(rng.integers(length2))
+        if pair not in on_path:
+            return pair
+    return pair
+
+
+def sample_residue_pairs(aligned_pairs, length1, length2, rng):
+    """Strided positives plus off-path negatives.
+
+    aligned_pairs: iter_aligned_residue_pairs() output, in alignment order.
+    Returns (pair_type, align_pos, residue_idx1, residue_idx2, marker); the
+    negatives carry align_pos -1 and marker "-".
+    """
+    on_path = {(i, j) for _, i, j, _, _, _ in aligned_pairs}
+    sampled = []
+    negatives = 0
+
+    for k, (align_pos, i, j, _, marker, _) in enumerate(aligned_pairs):
+        if k % ALIGNED_RESIDUE_STRIDE != 0:
+            continue
+        sampled.append(("aligned", align_pos, i, j, marker))
+
+        for _ in range(NEGATIVES_PER_POSITIVE):
+            kind = "shifted" if negatives % 2 == 0 else "random"
+            pair = shifted_pair(i, j, length2, rng) if kind == "shifted" else None
+            if pair is None:
+                kind = "random"
+                pair = random_pair(length1, length2, on_path, rng)
+            sampled.append((kind, -1, pair[0], pair[1], "-"))
+            negatives += 1
+
+    return sampled
 
 
 def load_protein_data(uniprot_id: str):
@@ -110,6 +211,10 @@ def input_rows(csv_path: str, start_row, end_row, skip_source_rows=frozenset()):
     """Stream tm_scores.csv rows whose SOURCE parquet row is in the window."""
     start_row = 0 if start_row is None else start_row
     line_no = 0
+    # tm_scores.csv itself contains duplicated source rows from overlapping
+    # shard runs. skip_source_rows is read once at startup, so without this a
+    # repeated input row is scored twice within a single run.
+    emitted = set()
 
     for df_chunk in pd.read_csv(
         csv_path,
@@ -124,9 +229,10 @@ def input_rows(csv_path: str, start_row, end_row, skip_source_rows=frozenset()):
                 continue
             if end_row is not None and source_row >= end_row:
                 continue
-            if source_row in skip_source_rows:
+            if source_row in skip_source_rows or source_row in emitted:
                 continue
 
+            emitted.add(source_row)
             yield source_row, row
 
 
@@ -137,34 +243,26 @@ def output_fields():
         "id1",
         "id2",
         "tm_score_norm1",
+        "tm_score_norm2",
+        "pair_type",
         "align_pos",
         "residue_idx1",
         "residue_idx2",
         "aa1",
         "seqM",
         "aa2",
-        "fgw_score",
-        "fgw_structure_term",
+        "superposed_dist",
+        "tm_term",
+        "gw_raw",
+        "fgw_raw",
         "fgw_feature_term",
         "neighborhood_size1",
         "neighborhood_size2",
     ]
 
 
-def write_result(
-    writer,
-    row,
-    input_row_idx,
-    residue_pair,
-    fgw_score,
-    structure_term,
-    feature_term,
-    n1,
-    n2,
-):
-    align_pos, residue_idx1, residue_idx2, aa1, marker, aa2 = residue_pair
+def write_result(writer, row, input_row_idx, record):
     source_row = row["row"] if "row" in row else input_row_idx
-
     writer.writerow(
         {
             "tm_data_row": input_row_idx,
@@ -172,17 +270,8 @@ def write_result(
             "id1": row["id1"],
             "id2": row["id2"],
             "tm_score_norm1": row["tm_score_norm1"],
-            "align_pos": align_pos,
-            "residue_idx1": residue_idx1,
-            "residue_idx2": residue_idx2,
-            "aa1": aa1,
-            "seqM": marker,
-            "aa2": aa2,
-            "fgw_score": fgw_score,
-            "fgw_structure_term": structure_term,
-            "fgw_feature_term": feature_term,
-            "neighborhood_size1": n1,
-            "neighborhood_size2": n2,
+            "tm_score_norm2": row["tm_score_norm2"],
+            **record,
         }
     )
 
@@ -191,51 +280,93 @@ def process_tm_row(row, input_row_idx, writer):
     id1 = str(row["id1"]).strip()
     id2 = str(row["id2"]).strip()
 
-    coords1, _, embeddings1 = load_protein_data(id1)
-    coords2, _, embeddings2 = load_protein_data(id2)
+    coords1, sequence1, embeddings1 = load_protein_data(id1)
+    coords2, sequence2, embeddings2 = load_protein_data(id2)
 
-    seqxA = str(row["seqxA"])
-    seqM = str(row["seqM"])
-    seqyA = str(row["seqyA"])
+    aligned_pairs = list(
+        iter_aligned_residue_pairs(str(row["seqxA"]), str(row["seqM"]), str(row["seqyA"]))
+    )
+    source_row = int(row["row"]) if "row" in row else int(input_row_idx)
+    rng = np.random.default_rng(source_row)
+    residue_pairs = sample_residue_pairs(aligned_pairs, len(coords1), len(coords2), rng)
+
+    translation, rotation = parse_superposition(row["superposition"])
+    superposed1 = coords1.astype(np.float64) @ rotation.T + translation
+    d0 = tm_d0(len(coords1))
 
     pending = []
-    for aligned_pair_idx, residue_pair in enumerate(
-        iter_aligned_residue_pairs(seqxA, seqM, seqyA)
-    ):
-        if aligned_pair_idx % ALIGNED_RESIDUE_STRIDE != 0:
-            continue
-
-        _, residue_idx1, residue_idx2, _, _, _ = residue_pair
-
+    for pair_type, align_pos, residue_idx1, residue_idx2, marker in residue_pairs:
         indices1 = knn_indices(coords1, residue_idx1)
         indices2 = knn_indices(coords2, residue_idx2)
 
-        fgw_distance, structure_term, feature_term = compute_local_fgw(
+        gw_raw, fgw_raw, feature_term = compute_local_labels(
             coords1[indices1],
             coords2[indices2],
             embeddings1[indices1],
             embeddings2[indices2],
         )
-        fgw_score = 1 - fgw_distance
+        distance = float(np.linalg.norm(superposed1[residue_idx1] - coords2[residue_idx2]))
 
         pending.append(
-            (residue_pair, fgw_score, structure_term, feature_term,
-             len(indices1), len(indices2))
+            {
+                "pair_type": pair_type,
+                "align_pos": align_pos,
+                "residue_idx1": residue_idx1,
+                "residue_idx2": residue_idx2,
+                "aa1": sequence1[residue_idx1],
+                "seqM": marker,
+                "aa2": sequence2[residue_idx2],
+                "superposed_dist": distance,
+                "tm_term": tm_term(distance, d0),
+                "gw_raw": gw_raw,
+                "fgw_raw": fgw_raw,
+                "fgw_feature_term": feature_term,
+                "neighborhood_size1": len(indices1),
+                "neighborhood_size2": len(indices2),
+            }
         )
 
-    for residue_pair, score, struct, feat, n1, n2 in pending:
-        write_result(writer, row, input_row_idx, residue_pair, score, struct, feat, n1, n2)
+    for record in pending:
+        write_result(writer, row, input_row_idx, record)
 
     return len(pending)
 
 
+def check_input_columns(csv_path):
+    header = pd.read_csv(csv_path, nrows=0).columns
+    missing = [name for name in REQUIRED_TM_COLUMNS if name not in header]
+    if missing:
+        print(
+            f"Error: {csv_path} lacks columns {missing}. Regenerate it with the "
+            f"current tm_data.py (it stores both TM normalisations and the "
+            f"superposition).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main():
-    args = build_parser(
+    parser = build_parser(
         "Compute local FGW scores for TM-aligned pairs in a parquet row window.",
         START_ROW,
         END_ROW,
-    ).parse_args()
+    )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="read already-completed rows from here instead of --output; lets "
+             "array tasks share one resume set while writing separate files",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="write here instead of OUTPUT_CSV; give each array task its own "
+             "file, since concurrent appends to one CSV interleave",
+    )
+    args = parser.parse_args()
     start_row, end_row = args.start_row, args.end_row
+    output_csv = args.output or OUTPUT_CSV
+    resume_csv = args.resume_from or output_csv
 
     if not os.path.exists(TM_DATA_CSV):
         print(f"Error: TM data CSV not found: {TM_DATA_CSV}", file=sys.stderr)
@@ -249,6 +380,7 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    check_input_columns(TM_DATA_CSV)
 
     print(f"TM data: {TM_DATA_CSV}")
     print(f"PDB dir: {PDB_DIR}")
@@ -258,11 +390,13 @@ def main():
     print(f"Flush every rows: {FLUSH_EVERY_ROWS}")
     print(f"k-NN size: {K_NEIGHBORS}")
     print(f"Aligned residue stride: {ALIGNED_RESIDUE_STRIDE}")
-    print(f"Structure exp scale: {STRUCTURE_EXP_SCALE}")
-    print(f"Output: {OUTPUT_CSV}")
+    print(f"Negatives per positive: {NEGATIVES_PER_POSITIVE} (shift range {SHIFT_RANGE})")
+    print(f"Distance scale: {DIST_SCALE} A, eps: {EPS}, fused alpha: {ALPHA}")
+    print(f"GW iterations: {OUTER_ITER} outer x {INNER_ITER} Sinkhorn")
+    print(f"Output: {output_csv}")
 
     skip_source_rows = (
-        frozenset() if args.no_resume else read_done_rows(OUTPUT_CSV, "source_row")
+        frozenset() if args.no_resume else read_done_rows(resume_csv, "source_row")
     )
     if skip_source_rows:
         print(f"Resume: {len(skip_source_rows)} pairs already scored, skipping them")
@@ -272,7 +406,7 @@ def main():
     rows_since_flush = 0
     last_row_processed = None
 
-    output_file, writer = open_appending_writer(OUTPUT_CSV, output_fields())
+    output_file, writer = open_appending_writer(output_csv, output_fields())
     with output_file:
         for input_row_idx, row in input_rows(
             TM_DATA_CSV, start_row, end_row, skip_source_rows
@@ -286,7 +420,7 @@ def main():
                 total_pairs += scored_pairs
                 print(
                     f"[row {input_row_idx}] {row['id1']} vs {row['id2']}: "
-                    f"{scored_pairs} local FGW scores"
+                    f"{scored_pairs} local labels"
                 )
                 rows_since_flush += 1
                 if rows_since_flush >= FLUSH_EVERY_ROWS:
@@ -307,11 +441,11 @@ def main():
             write_progress(PROGRESS_FILE, last_row_processed)
 
     print("-" * 60)
-    print(f"Done. Local FGW scores: {total_pairs}")
+    print(f"Done. Local labels: {total_pairs}")
     log_failures(failures, total_pairs + len(failures))
-    print(f"Results saved to: {os.path.abspath(OUTPUT_CSV)}")
+    print(f"Results saved to: {os.path.abspath(output_csv)}")
     manifest = write_run_manifest(
-        OUTPUT_CSV,
+        output_csv,
         {
             "stage": "fgw_data",
             "start_row": start_row,

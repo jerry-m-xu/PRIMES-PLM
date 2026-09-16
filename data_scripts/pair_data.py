@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from common import embedding_path, log, pdb_path
+from fgw import FGW_LABEL_SCALE, GW_LABEL_SCALE, similarity_from_distortion
 from parse_pdb import parse_pdb
 from patches import K_NEIGHBORS, knn_indices, pad_patch
 from splits import row_split
@@ -18,12 +19,26 @@ USECOLS = [
     "id2",
     "residue_idx1",
     "residue_idx2",
-    "fgw_score",
-    "fgw_structure_term",
+    "gw_raw",
+    "fgw_raw",
+    "tm_term",
+    "pair_type",
     "tm_score_norm1",
+    "tm_score_norm2",
 ]
 
-FGW_TARGETS = ("structure", "composite")
+# The CSV stores raw distortions; the labels are exp(-raw / scale), in (0, 1].
+# "structure": pure-GW distortion of the two patches, features not consulted.
+# "composite": the fused objective, which also rewards ESM agreement.
+# "tm_term":   1 / (1 + (d / d0)^2) from TM-align's superposition; chirality-
+#              aware, and low for residues that are locally intact but displaced.
+# The scales live in fgw.py so the audit, this loader and the checkpoint
+# configs agree; choose them from audit_fgw_data.py's label percentiles.
+FGW_TARGETS = ("structure", "composite", "tm_term")
+
+# fgw_data.py's pair_type column, as small integers for the batch
+PAIR_TYPES = ("aligned", "shifted", "random")
+PAIR_TYPE_CODES = {name: code for code, name in enumerate(PAIR_TYPES)}
 
 
 def select_fgw_target(batch, mode="structure"):
@@ -31,6 +46,8 @@ def select_fgw_target(batch, mode="structure"):
         return batch["fgw_structure"]
     if mode == "composite":
         return batch["fgw"]
+    if mode == "tm_term":
+        return batch["tm_term"]
     raise ValueError(f"unknown FGW target {mode!r}, expected one of {FGW_TARGETS}")
 
 
@@ -212,11 +229,19 @@ class ProteinPairDataset(Dataset):
             "patch_coords2": pc2,
             "patch_features2": pf2,
             "patch_mask2": pm2,
-            "fgw": group["fgw_score"].to_numpy().astype(np.float32),
-            "fgw_structure": (
-                1.0 - group["fgw_structure_term"].to_numpy().astype(np.float32)
+            "fgw": similarity_from_distortion(
+                group["fgw_raw"].to_numpy(), FGW_LABEL_SCALE
+            ).astype(np.float32),
+            "fgw_structure": similarity_from_distortion(
+                group["gw_raw"].to_numpy(), GW_LABEL_SCALE
+            ).astype(np.float32),
+            "tm_term": group["tm_term"].to_numpy().astype(np.float32),
+            "pair_type": np.array(
+                [PAIR_TYPE_CODES[str(name)] for name in group["pair_type"]],
+                dtype=np.int64,
             ),
             "tm": np.float32(group["tm_score_norm1"].iloc[0]),
+            "tm2": np.float32(group["tm_score_norm2"].iloc[0]),
         }
 
         if self.include_sequence:
@@ -260,8 +285,11 @@ def collate_pairs(items):
 
     out = {
         "tm": torch.zeros(batch_size),
+        "tm2": torch.zeros(batch_size),
         "fgw": torch.zeros(batch_size, max_residues),
         "fgw_structure": torch.zeros(batch_size, max_residues),
+        "tm_term": torch.zeros(batch_size, max_residues),
+        "pair_type": torch.full((batch_size, max_residues), -1, dtype=torch.long),
         "pair_mask": torch.zeros(batch_size, max_residues, dtype=torch.bool),
     }
     for side in ("1", "2"):
@@ -315,10 +343,13 @@ def collate_pairs(items):
     for i, item in enumerate(items):
         num_residues = len(item["fgw"])
         out["tm"][i] = float(item["tm"])
+        out["tm2"][i] = float(item["tm2"])
         out["fgw"][i, :num_residues] = torch.from_numpy(item["fgw"])
         out["fgw_structure"][i, :num_residues] = torch.from_numpy(
             item["fgw_structure"]
         )
+        out["tm_term"][i, :num_residues] = torch.from_numpy(item["tm_term"])
+        out["pair_type"][i, :num_residues] = torch.from_numpy(item["pair_type"])
         out["pair_mask"][i, :num_residues] = True
 
         for side in ("1", "2"):

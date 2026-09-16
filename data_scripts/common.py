@@ -25,25 +25,23 @@ def write_progress(progress_file, row_idx):
 
 
 def read_done_rows(csv_path, column):
-    """Source rows already present in an output file, for resume."""
+    """Source rows already present in an output file, for resume.
+
+    Reads only the one column: tm_scores.csv carries full sequences, so
+    parsing every field costs about a gigabyte of string work per startup.
+    """
     if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
         return set()
 
-    import csv as _csv
+    import pandas as pd
 
-    done = set()
-    with open(csv_path, newline="") as handle:
-        reader = _csv.DictReader(handle)
-        if reader.fieldnames is None or column not in reader.fieldnames:
-            return set()
-        for row in reader:
-            value = row.get(column, "")
-            if value not in ("", None):
-                try:
-                    done.add(int(value))
-                except ValueError:
-                    continue
-    return done
+    try:
+        values = pd.read_csv(csv_path, usecols=[column], keep_default_na=False)[column]
+    except ValueError:  # column absent
+        return set()
+
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    return set(values.astype(int).tolist())
 
 
 def log(msg):
@@ -84,6 +82,59 @@ def iter_row_groups(parquet_file, start_row, end_row):
             return
         yield index, offset
         offset += num_rows
+
+
+def iter_parquet_rows(parquet_file, columns, start_row, end_row, batch_size=65536):
+    """Yield (global_row_index, {column: value}) for rows in [start_row, end_row).
+
+    Streams Arrow batches rather than materialising a whole row group in
+    pandas. The source parquet has 64M-row groups, so the old approach cost
+    several GB per process, once per shard.
+    """
+    start_row = 0 if start_row is None else start_row
+
+    for group_index, group_start in iter_row_groups(parquet_file, start_row, end_row):
+        offset = group_start
+        for batch in parquet_file.iter_batches(
+            batch_size=batch_size, row_groups=[group_index], columns=list(columns)
+        ):
+            batch_end = offset + batch.num_rows
+            if batch_end <= start_row:
+                offset = batch_end
+                continue
+            if end_row is not None and offset >= end_row:
+                return
+
+            values = batch.to_pydict()
+            for local_index in range(batch.num_rows):
+                global_row = offset + local_index
+                if global_row < start_row:
+                    continue
+                if end_row is not None and global_row >= end_row:
+                    return
+                yield global_row, {name: values[name][local_index] for name in columns}
+            offset = batch_end
+
+
+def format_superposition(translation, rotation):
+    """TM-align's superposition as 12 floats: t (3), then u row-major (9).
+
+    Chain 1 maps onto chain 2 as y ~ u @ x + t.
+    """
+    values = [float(v) for v in translation] + [float(v) for row in rotation for v in row]
+    if len(values) != 12:
+        raise ValueError(f"expected 3 + 9 values, got {len(values)}")
+    return " ".join(f"{v:.6f}" for v in values)
+
+
+def parse_superposition(text):
+    """Inverse of format_superposition: returns (translation (3,), rotation (3, 3))."""
+    import numpy as np
+
+    values = np.array(str(text).split(), dtype=np.float64)
+    if values.size != 12:
+        raise ValueError(f"superposition needs 12 numbers, got {values.size}: {text!r}")
+    return values[:3], values[3:].reshape(3, 3)
 
 
 def write_run_manifest(output_path, record):
