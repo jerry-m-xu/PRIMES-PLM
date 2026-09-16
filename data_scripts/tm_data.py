@@ -8,7 +8,8 @@ from tmtools import tm_align
 
 from common import (
     build_parser,
-    iter_row_groups,
+    format_superposition,
+    iter_parquet_rows,
     log_failures,
     open_appending_writer,
     pdb_path,
@@ -69,9 +70,13 @@ def run_tm_align(uniprot_id1: str, uniprot_id2: str):
         "seq1": seq1,
         "seq2": seq2,
         "tm_score_norm1": float(result.tm_norm_chain1),
+        "tm_score_norm2": float(result.tm_norm_chain2),
+        "rmsd": float(result.rmsd),
         "seqxA": result.seqxA,
         "seqM": result.seqM,
         "seqyA": result.seqyA,
+        # chain 1 onto chain 2; fgw_data.py turns it into per-residue TM terms
+        "superposition": format_superposition(result.t, result.u),
     }
 
 
@@ -79,27 +84,16 @@ def iter_pairs(parquet_path: str, col1: str, col2: str, start_row: int, end_row,
                skip_rows=frozenset()):
     """Yield (global_parquet_row, id1, id2) over the requested window."""
     parquet_file = pq.ParquetFile(parquet_path)
-    start_row = 0 if start_row is None else start_row
 
-    for row_group_idx, group_start in iter_row_groups(
-        parquet_file, start_row, end_row
+    for global_row_idx, row in iter_parquet_rows(
+        parquet_file, [col1, col2], start_row, end_row
     ):
-        table = parquet_file.read_row_group(row_group_idx, columns=[col1, col2])
-        df_chunk = table.to_pandas()
+        if global_row_idx in skip_rows:
+            continue
 
-        for local_idx, (_, row) in enumerate(df_chunk.iterrows()):
-            global_row_idx = group_start + local_idx
-
-            if global_row_idx < start_row:
-                continue
-            if end_row is not None and global_row_idx >= end_row:
-                return
-            if global_row_idx in skip_rows:
-                continue
-
-            id1 = str(row[col1]).strip()
-            id2 = str(row[col2]).strip()
-            yield global_row_idx, id1, id2
+        id1 = str(row[col1]).strip()
+        id2 = str(row[col2]).strip()
+        yield global_row_idx, id1, id2
 
 
 def output_fields():
@@ -109,20 +103,38 @@ def output_fields():
         "seq1",
         "seq2",
         "tm_score_norm1",
+        "tm_score_norm2",
+        "rmsd",
         "seqxA",
         "seqM",
         "seqyA",
+        "superposition",
         "row",
     ]
 
 
 def main():
-    args = build_parser(
+    parser = build_parser(
         "TM-align every protein pair in a parquet row window.",
         START_ROW,
         END_ROW,
-    ).parse_args()
+    )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="read already-completed rows from here instead of --output; lets "
+             "array tasks share one resume set while writing separate files",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="write here instead of OUTPUT_CSV; give each array task its own "
+             "file, since concurrent appends to one CSV interleave",
+    )
+    args = parser.parse_args()
     start_row, end_row = args.start_row, args.end_row
+    output_csv = args.output or OUTPUT_CSV
+    resume_csv = args.resume_from or output_csv
 
     if not os.path.exists(PARQUET_PATH):
         print(f"Error: parquet file not found: {PARQUET_PATH}", file=sys.stderr)
@@ -135,11 +147,11 @@ def main():
     print(f"PDB dir: {PDB_DIR}")
     print(f"Rows: [{start_row}, {end_row if end_row is not None else 'EOF'})")
     print(f"Max sequence length: {MAX_SEQUENCE_LENGTH}")
-    print(f"Output: {OUTPUT_CSV}")
+    print(f"Output: {output_csv}")
     print(f"Progress file: {PROGRESS_FILE}")
     print(f"Flush every rows: {FLUSH_EVERY_ROWS}")
 
-    skip_rows = frozenset() if args.no_resume else read_done_rows(OUTPUT_CSV, "row")
+    skip_rows = frozenset() if args.no_resume else read_done_rows(resume_csv, "row")
     if skip_rows:
         print(f"Resume: {len(skip_rows)} pairs already written, skipping them")
 
@@ -148,7 +160,7 @@ def main():
     rows_since_flush = 0
     last_row_processed = None
 
-    output_file, writer = open_appending_writer(OUTPUT_CSV, output_fields())
+    output_file, writer = open_appending_writer(output_csv, output_fields())
     with output_file:
         for row_idx, id1, id2 in iter_pairs(
             PARQUET_PATH, COL1, COL2, start_row, end_row, skip_rows=skip_rows
@@ -184,9 +196,9 @@ def main():
     print(f"Done. Successful: {success}")
     log_failures(failures, success + len(failures))
     print(f"Last row processed: {last_row_processed}")
-    print(f"Results saved to: {os.path.abspath(OUTPUT_CSV)}")
+    print(f"Results saved to: {os.path.abspath(output_csv)}")
     manifest = write_run_manifest(
-        OUTPUT_CSV,
+        output_csv,
         {
             "stage": "tm_data",
             "start_row": start_row,

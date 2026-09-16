@@ -11,7 +11,7 @@ import torch
 from common import (
     build_parser,
     embedding_path,
-    iter_row_groups,
+    iter_parquet_rows,
     log_failures,
     pdb_path,
     write_progress,
@@ -52,36 +52,26 @@ def iter_unique_protein_ids(parquet_path: str, start_row, end_row, progress=None
 
     seen = set()
 
-    for row_group_idx, group_start in iter_row_groups(
-        parquet_file, start_row, end_row
+    for global_row_idx, row in iter_parquet_rows(
+        parquet_file, [COL1, COL2], start_row, end_row
     ):
-        table = parquet_file.read_row_group(row_group_idx, columns=[COL1, COL2])
-        df_chunk = table.to_pandas()
+        if progress is not None:
+            progress["last_row_processed"] = global_row_idx
 
-        for local_idx, (_, row) in enumerate(df_chunk.iterrows()):
-            global_row_idx = group_start + local_idx
+        id1 = str(row[COL1]).strip()
+        id2 = str(row[COL2]).strip()
+        if not valid_id(id1) or not valid_id(id2):
+            print(
+                f"[row {global_row_idx}] invalid protein ID; skipping pair",
+                file=sys.stderr,
+            )
+            continue
 
-            if global_row_idx < start_row:
+        for protein_id in (id1, id2):
+            if protein_id in seen:
                 continue
-            if global_row_idx >= end_row:
-                return
-            if progress is not None:
-                progress["last_row_processed"] = global_row_idx
-
-            id1 = str(row[COL1]).strip()
-            id2 = str(row[COL2]).strip()
-            if not valid_id(id1) or not valid_id(id2):
-                print(
-                    f"[row {global_row_idx}] invalid protein ID; skipping pair",
-                    file=sys.stderr,
-                )
-                continue
-
-            for protein_id in (id1, id2):
-                if protein_id in seen:
-                    continue
-                seen.add(protein_id)
-                yield protein_id
+            seen.add(protein_id)
+            yield protein_id
 
 
 def manifest_fields():

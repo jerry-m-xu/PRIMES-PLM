@@ -30,6 +30,21 @@ def run_stage(script, description, args):
     ]
     if args.no_resume:
         command.append("--no-resume")
+    if args.output_suffix and script in ("tm_data", "fgw_data"):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            script, os.path.join(HERE, f"{script}.py")
+        )
+        base = None
+        with open(os.path.join(HERE, f"{script}.py")) as handle:
+            for line in handle:
+                if line.startswith("OUTPUT_CSV"):
+                    base = line.split('"')[1]
+                    break
+        if base:
+            root, ext = os.path.splitext(base)
+            command += ["--output", f"{root}{args.output_suffix}{ext}"]
 
     log("")
     log("=" * 66)
@@ -61,6 +76,12 @@ def main():
         "--stages",
         default="all",
         help="comma-separated subset, e.g. 'tm_data,fgw_data' (default: all)",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="",
+        help="suffix each stage's CSV, e.g. '.shard3'. Use this for array jobs: "
+             "concurrent appends to one CSV interleave rows. Concatenate after.",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

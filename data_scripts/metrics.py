@@ -60,7 +60,7 @@ def log_validation(metrics, prefix):
     """One line per signal. metrics maps a signal name to summarise() output."""
     if metrics is None:
         return
-    for name in ("fgw", "tm"):
+    for name in ("fgw", "tm", "tm2"):
         if name not in metrics:
             continue
         values = metrics[name]
@@ -71,6 +71,28 @@ def log_validation(metrics, prefix):
         )
     if "agreement" in metrics:
         log(f"{prefix} teacher agreement (cosine): {metrics['agreement']:.4f}")
+
+
+def report_by_group(predictions, targets, groups, names, title):
+    """One metrics line per group code, e.g. per pair type."""
+    predictions = np.asarray(predictions, dtype=np.float64)
+    targets = np.asarray(targets, dtype=np.float64)
+    groups = np.asarray(groups)
+    log("")
+    log(f"  {title}")
+    log(
+        f"  {'group':<10}{'n':>9}{'mse':>10}{'r2':>8}{'pearson':>9}"
+        f"{'mean pred':>11}{'mean target':>13}"
+    )
+    for code, name in enumerate(names):
+        mask = groups == code
+        if not mask.any():
+            continue
+        values = compute_metrics(predictions[mask], targets[mask])
+        log(
+            f"  {name:<10}{values['n']:>9}{values['mse']:>10.4f}{values['r2']:>8.3f}"
+            f"{values['pearson']:>9.3f}{values['pred_mean']:>11.3f}{values['target_mean']:>13.3f}"
+        )
 
 
 def report(title, predictions, targets):
