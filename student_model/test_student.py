@@ -19,8 +19,9 @@ for _path in (
         sys.path.insert(0, _path)
 
 from common import log  # noqa: E402
-from metrics import report, report_esm_baseline  # noqa: E402
+from metrics import report, report_by_group, report_esm_baseline  # noqa: E402
 from pair_data import (  # noqa: E402
+    PAIR_TYPES,
     ProteinDataCache,
     clip_unit,
     collate_pairs,
@@ -58,7 +59,7 @@ def load_student(checkpoint_path):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(checkpoint_path)
 
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     config = checkpoint["config"]
 
     student = SequenceStudent(
@@ -79,8 +80,9 @@ def load_student(checkpoint_path):
 
 @torch.no_grad()
 def evaluate(student, teacher, cache):
-    fgw_pred, tm_pred, tm_true, agreement = [], [], [], []
-    targets = {"structure": [], "composite": []}
+    fgw_pred, tm_pred, tm_true, tm2_pred, tm2_true, agreement = [], [], [], [], [], []
+    pair_types = []
+    targets = {"structure": [], "composite": [], "tm_term": []}
     esm_baseline = []
     skipped = 0
     buffer_idx = 0
@@ -110,17 +112,21 @@ def evaluate(student, teacher, cache):
                 out = student_forward(student, batch)
                 mask = batch["pair_mask"]
 
-                fgw_pred.append(out["cosine_similarity"][mask].cpu().numpy())
+                fgw_pred.append(out["local_similarity"][mask].cpu().numpy())
                 targets["structure"].append(
                     clip_unit(batch["fgw_structure"], CLIP_TARGETS)[mask].cpu().numpy()
                 )
                 targets["composite"].append(
                     clip_unit(batch["fgw"], CLIP_TARGETS)[mask].cpu().numpy()
                 )
+                targets["tm_term"].append(batch["tm_term"][mask].cpu().numpy())
+                pair_types.append(batch["pair_type"][mask].cpu().numpy())
                 esm_baseline.append(esm_baseline_similarity(batch)[mask].cpu().numpy())
                 if "tm_score_pred" in out:
                     tm_pred.append(out["tm_score_pred"].cpu().numpy())
                     tm_true.append(clip_unit(batch["tm"], CLIP_TARGETS).cpu().numpy())
+                    tm2_pred.append(out["tm_score_pred2"].cpu().numpy())
+                    tm2_true.append(clip_unit(batch["tm2"], CLIP_TARGETS).cpu().numpy())
 
                 if teacher is not None:
                     for side, key in (("1", "residue_z1"), ("2", "residue_z2")):
@@ -137,8 +143,10 @@ def evaluate(student, teacher, cache):
     return {
         "fgw_pred": np.concatenate(fgw_pred),
         "targets": {k: np.concatenate(v) for k, v in targets.items()},
+        "pair_types": np.concatenate(pair_types),
         "esm_baseline": np.concatenate(esm_baseline),
         "tm": (np.concatenate(tm_pred), np.concatenate(tm_true)) if tm_pred else None,
+        "tm2": (np.concatenate(tm2_pred), np.concatenate(tm2_true)) if tm2_pred else None,
         "agreement": np.concatenate(agreement) if agreement else None,
         "skipped": skipped,
     }
@@ -180,12 +188,19 @@ def main():
         predictions,
         targets["structure"],
     )
-    report("FGW composite (fgw_score, 30% ESM echo)", predictions, targets["composite"])
+    report("FGW composite (fused: 70% structure, 30% ESM cosine)", predictions, targets["composite"])
+    report("TM term (per residue pair, from TM-align's superposition)", predictions, targets["tm_term"])
 
     report_esm_baseline(results["esm_baseline"], predictions, targets)
 
+    report_by_group(
+        predictions, targets.get(trained_on, targets["structure"]), results["pair_types"],
+        PAIR_TYPES, f"{trained_on} target by pair type (aligned = on TM-align's path)",
+    )
+
     if results["tm"] is not None:
-        report("TM   (per protein pair)", *results["tm"])
+        report("TM   normalised by protein 1 (per protein pair)", *results["tm"])
+        report("TM   normalised by protein 2 (per protein pair)", *results["tm2"])
     else:
         log("")
         log("  TM   : student has no TM head")
