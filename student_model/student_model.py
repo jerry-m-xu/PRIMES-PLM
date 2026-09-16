@@ -12,7 +12,11 @@ TEACHER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 if TEACHER_DIR not in sys.path:
     sys.path.insert(0, TEACHER_DIR)
 
-from egnn_model import TMScoreHead  # noqa: E402
+from egnn_model import SimilarityCalibration  # noqa: E402
+
+NUM_SIMILARITY_STATS = 5
+SOFT_ALIGNMENT_TEMPERATURE = 0.1
+LENGTH_NORMALISER = math.log(1001.0)  # log1p(length) / this is in (0, 1] up to 1000 residues
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -34,6 +38,74 @@ class SinusoidalPositionalEncoding(nn.Module):
                 f"table ({self.encoding.shape[1]})"
             )
         return x + self.encoding[:, : x.shape[1]]
+
+
+def similarity_statistics(similarity, mask1, mask2, temperature=SOFT_ALIGNMENT_TEMPERATURE):
+    """Coverage-like summaries of the residue-by-residue similarity matrix.
+
+    similarity: [B, L1, L2] cosines; mask1: [B, L1]; mask2: [B, L2].
+    Returns [B, 5]: the mean over protein 1 of each residue's best partner
+    in protein 2, the same from protein 2's side, the two soft-alignment
+    pooled similarities (softmax over the partner axis), and the mean over
+    all valid pairs. These are what TM-score measures beyond patch
+    similarity: how much of each protein finds a good partner.
+    """
+    valid = mask1[:, :, None] & mask2[:, None, :]
+    # cosines are in [-1, 1]; a finite fill keeps softmax free of NaN on
+    # fully padded rows, which the masked means then drop anyway
+    masked = similarity.masked_fill(~valid, -1e4)
+
+    def masked_mean(values, mask):
+        weights = mask.to(values.dtype)
+        return (values * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+
+    row_best = masked.max(dim=2).values
+    col_best = masked.max(dim=1).values
+    row_soft = (torch.softmax(masked / temperature, dim=2) * similarity).sum(dim=2)
+    col_soft = (torch.softmax(masked / temperature, dim=1) * similarity).sum(dim=1)
+    valid_f = valid.to(similarity.dtype)
+    mean_all = (similarity * valid_f).sum(dim=(1, 2)) / valid_f.sum(dim=(1, 2)).clamp(min=1.0)
+
+    return torch.stack(
+        [
+            masked_mean(row_best, mask1),
+            masked_mean(col_best, mask2),
+            masked_mean(row_soft, mask1),
+            masked_mean(col_soft, mask2),
+            mean_all,
+        ],
+        dim=-1,
+    )
+
+
+class GlobalHead(nn.Module):
+    """TM-score from what a whole-protein view can see.
+
+    Inputs: the two pooled residue embeddings, coverage statistics of the
+    similarity matrix, and both log lengths. Predicts both normalisations,
+    by protein 1's length and by protein 2's, since TM-score is asymmetric.
+    """
+
+    def __init__(self, embedding_dim, hidden_dim=None, num_stats=NUM_SIMILARITY_STATS):
+        super().__init__()
+        hidden_dim = hidden_dim or embedding_dim
+        input_dim = embedding_dim * 4 + num_stats + 2
+
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, g1, g2, stats, length1, length2):
+        log_lengths = torch.stack(
+            [torch.log1p(length1.float()), torch.log1p(length2.float())], dim=-1
+        ) / LENGTH_NORMALISER
+        features = torch.cat(
+            [g1, g2, torch.abs(g1 - g2), g1 * g2, stats, log_lengths.to(g1.dtype)], dim=-1
+        )
+        return self.mlp(features)
 
 
 class SequenceStudent(nn.Module):
@@ -77,11 +149,15 @@ class SequenceStudent(nn.Module):
         )
 
         self.output_dim = output_dim
+        self.calibration = SimilarityCalibration()
         self.use_tm_head = use_tm_head
-        self.tm_head = TMScoreHead(output_dim) if use_tm_head else None
+        self.global_head = GlobalHead(output_dim) if use_tm_head else None
 
     def forward(self, features, seq_mask=None):
-        """features: [B, L, input_dim] -> per-residue unit vectors [B, L, output_dim]."""
+        """features: [B, L, input_dim] -> per-residue unit vectors [B, L, output_dim].
+
+        Padded positions come back as zero vectors.
+        """
         h = self.input_proj(features)
         h = self.positional(h)
 
@@ -103,18 +179,10 @@ class SequenceStudent(nn.Module):
 
     @staticmethod
     def masked_mean(z, mask):
-        """Mask-aware pooling; padded rows hold unit vectors, not zeros."""
+        """Mask-aware pooling to a unit vector."""
         weights = mask.unsqueeze(-1).float()
         pooled = (z * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1e-6)
         return F.normalize(pooled, dim=-1)
-
-    def predict_tm(self, z1, seq_mask1, z2, seq_mask2):
-        """TM from pooled per-residue embeddings; forward_pair inlines this."""
-        if not self.use_tm_head or self.tm_head is None:
-            return None
-        g1 = self.masked_mean(z1, seq_mask1)
-        g2 = self.masked_mean(z2, seq_mask2)
-        return self.tm_head(g1, g2)
 
     def forward_pair(
         self,
@@ -128,22 +196,34 @@ class SequenceStudent(nn.Module):
         extra_residue_idx1=None,
         extra_residue_idx2=None,
     ):
-        """One protein pair per batch row, with K sampled residue pairs each."""
+        """One protein pair per batch row, with K sampled residue pairs each.
+
+        "cosine_similarity" is the raw cosine between the sampled residues'
+        embeddings; "local_similarity" is its calibrated version, trained
+        against the label. "similarity_matrix" is the full [B, L1, L2]
+        cosine matrix, which the global head summarises and which an
+        alignment decoder can consume.
+        """
         z1 = self.forward(features1, seq_mask1)
         z2 = self.forward(features2, seq_mask2)
 
         residue_z1 = self.gather_residues(z1, residue_idx1)
         residue_z2 = self.gather_residues(z2, residue_idx2)
+        cosine_similarity = (residue_z1 * residue_z2).sum(dim=-1)
 
         global_seq_z1 = self.masked_mean(z1, seq_mask1)
         global_seq_z2 = self.masked_mean(z2, seq_mask2)
 
+        similarity_matrix = torch.bmm(z1, z2.transpose(1, 2))
+
         outputs = {
             "residue_z1": residue_z1,
             "residue_z2": residue_z2,
-            "cosine_similarity": (residue_z1 * residue_z2).sum(dim=-1),
+            "cosine_similarity": cosine_similarity,
+            "local_similarity": self.calibration(cosine_similarity),
             "global_seq_z1": global_seq_z1,
             "global_seq_z2": global_seq_z2,
+            "similarity_matrix": similarity_matrix,
         }
 
         if pair_mask is not None:
@@ -155,8 +235,18 @@ class SequenceStudent(nn.Module):
         if extra_residue_idx2 is not None:
             outputs["extra_z2"] = self.gather_residues(z2, extra_residue_idx2)
 
-        if self.use_tm_head and self.tm_head is not None:
-            outputs["tm_score_pred"] = self.tm_head(global_seq_z1, global_seq_z2)
+        if self.use_tm_head and self.global_head is not None:
+            stats = similarity_statistics(similarity_matrix, seq_mask1.bool(), seq_mask2.bool())
+            tm = self.global_head(
+                global_seq_z1,
+                global_seq_z2,
+                stats,
+                seq_mask1.sum(dim=1),
+                seq_mask2.sum(dim=1),
+            )
+            outputs["tm_score_pred"] = tm[:, 0]
+            outputs["tm_score_pred2"] = tm[:, 1]
+            outputs["similarity_stats"] = stats
         return outputs
 
 

@@ -22,6 +22,8 @@ for _path in (
 from egnn_model import SiameseEGNNTeacher  # noqa: E402
 from common import log  # noqa: E402
 from common import log_failures  # noqa: E402
+from fgw import FGW_LABEL_SCALE, GW_LABEL_SCALE  # noqa: E402
+from losses import LossBalancer  # noqa: E402
 from metrics import log_validation, summarise  # noqa: E402
 from pair_data import (  # noqa: E402
     ProteinDataCache,
@@ -66,14 +68,18 @@ FF_DIM = 1024
 DROPOUT = 0.1
 
 CLIP_TARGETS = True
-FGW_TARGET = "structure"  # see pair_data.py; "composite" rewards echoing ESM
+FGW_TARGET = "structure"  # see pair_data.FGW_TARGETS; "composite" rewards echoing ESM
 
 EXTRA_DISTILL_RESIDUES = 16
 
+# prior weights; under LOSS_BALANCE = "uncertainty" each term is also rescaled
+# by a learned precision, so the ~0.01-scale label MSEs are not drowned by the
+# ~0.3-scale distillation cosine (losses.py)
 W_DISTILL = 1.0  # per-residue embedding distillation
 W_GLOBAL = 0.5  # global embedding distillation (the teacher's fold-level view)
 W_FGW = 1.0
-W_TM = 0.2
+W_TM = 0.2  # both TM normalisations, from the student's own global head
+LOSS_BALANCE = "uncertainty"  # or "fixed"
 
 PROTEIN_CACHE_SIZE = 512
 CHECKPOINT_EVERY_BUFFERS = 10
@@ -87,7 +93,10 @@ RESUME_PATH = None
 
 CONFIG_FINGERPRINT = {
     "fgw_target": FGW_TARGET,
+    "gw_label_scale": GW_LABEL_SCALE,
+    "fgw_label_scale": FGW_LABEL_SCALE,
     "use_tm_head": W_TM > 0,
+    "loss_balance": LOSS_BALANCE,
     "hidden_dim": HIDDEN_DIM,
     "num_layers": NUM_LAYERS,
     "num_heads": NUM_HEADS,
@@ -112,18 +121,22 @@ def resume_path():
     return RESUME_PATH or os.path.join(CHECKPOINT_DIR, LATEST_CHECKPOINT_NAME)
 
 
-def load_resume_state(model, optimizer):
+def load_resume_state(model, balancer, optimizer):
     """Continue a run that was cut short by a wall-clock limit.
 
     Returns (start_epoch, skip_groups, start_buffer, epoch_loss, epoch_examples,
     best_val). Resume is buffer-granular: at most one buffer of work is redone.
+    A checkpoint written at an epoch boundary (epoch_complete) starts the
+    next epoch from scratch rather than redoing the finished one.
     """
     path = resume_path()
     if not RESUME or not os.path.exists(path):
         return 1, 0, 0, 0.0, 0, float("inf")
 
-    checkpoint = torch.load(path, map_location=DEVICE)
+    checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
+    if checkpoint.get("balancer_state_dict") is not None:
+        balancer.load_state_dict(checkpoint["balancer_state_dict"])
     if checkpoint.get("optimizer_state_dict"):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -137,19 +150,24 @@ def load_resume_state(model, optimizer):
 
     epoch = checkpoint.get("epoch", 1)
     buffer_idx = checkpoint.get("buffer_idx", 0)
-    log(
-        f"resuming {path}: epoch {epoch}, after buffer {buffer_idx} "
-        f"({buffer_idx * GROUPS_PER_BUFFER} protein pairs already seen this epoch)"
-    )
+    epoch_loss = checkpoint.get("epoch_loss", 0.0)
+    epoch_examples = checkpoint.get("epoch_examples", 0)
+    if checkpoint.get("epoch_complete"):
+        epoch, buffer_idx, epoch_loss, epoch_examples = epoch + 1, 0, 0.0, 0
+        log(f"resuming {path}: epoch {epoch - 1} complete, starting epoch {epoch}")
+    else:
+        log(
+            f"resuming {path}: epoch {epoch}, after buffer {buffer_idx} "
+            f"({buffer_idx * GROUPS_PER_BUFFER} protein pairs already seen this epoch)"
+        )
     return (
         epoch,
         buffer_idx * GROUPS_PER_BUFFER,
         buffer_idx,
-        checkpoint.get("epoch_loss", 0.0),
-        checkpoint.get("epoch_examples", 0),
+        epoch_loss,
+        epoch_examples,
         checkpoint.get("best_val", float("inf")),
     )
-
 
 
 def make_dataset(groups, cache, extra_distill_residues=0):
@@ -159,6 +177,13 @@ def make_dataset(groups, cache, extra_distill_residues=0):
         include_sequence=True,
         max_seq_length=MAX_SEQ_LENGTH,
         extra_distill_residues=extra_distill_residues,
+    )
+
+
+def build_balancer():
+    return LossBalancer(
+        {"distill": W_DISTILL, "global": W_GLOBAL, "fgw": W_FGW, "tm": W_TM},
+        mode=LOSS_BALANCE,
     )
 
 
@@ -198,7 +223,7 @@ def teacher_global(teacher, teacher_z, pair_mask):
     return torch.nn.functional.normalize(pooled, dim=-1)
 
 
-def compute_losses(student_out, teacher_z1, teacher_z2, batch, teacher=None):
+def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher=None):
     pair_mask = batch["pair_mask"]
 
     distill = 0.5 * (
@@ -214,8 +239,8 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, teacher=None):
             global_distill = global_distill + 0.5 * (1.0 - cosine).mean()
 
     # unlabelled residues: distillation only, no FGW/TM target exists for them
-    extra_distill = torch.zeros((), device=distill.device)
     if teacher is not None and "extra_z1" in student_out:
+        extra_distill = torch.zeros((), device=distill.device)
         for side in ("1", "2"):
             reference = teacher_embeddings(teacher, batch, side, prefix="extra_")
             extra_distill = extra_distill + 0.5 * distillation_loss(
@@ -223,29 +248,30 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, teacher=None):
             )
         distill = 0.5 * (distill + extra_distill)
 
-    fgw = masked_mse(student_out["cosine_similarity"], fgw_target(batch, FGW_TARGET, CLIP_TARGETS), pair_mask)
-
-    tm = torch.zeros((), device=distill.device)
-    if "tm_score_pred" in student_out:
-        tm = torch.mean(
-            (student_out["tm_score_pred"] - clip_unit(batch["tm"], CLIP_TARGETS)) ** 2
-        )
-
-    total = (
-        W_DISTILL * distill
-        + W_GLOBAL * global_distill
-        + W_FGW * fgw
-        + W_TM * tm
-    )
-    return total, {
-        "distill": distill.item(),
-        "global": float(global_distill),
-        "fgw": fgw.item(),
-        "tm": float(tm),
+    losses = {
+        "distill": distill,
+        "global": global_distill,
+        "fgw": masked_mse(
+            student_out["local_similarity"],
+            fgw_target(batch, FGW_TARGET, CLIP_TARGETS),
+            pair_mask,
+        ),
     }
 
+    if "tm_score_pred" in student_out:
+        tm1 = torch.mean(
+            (student_out["tm_score_pred"] - clip_unit(batch["tm"], CLIP_TARGETS)) ** 2
+        )
+        tm2 = torch.mean(
+            (student_out["tm_score_pred2"] - clip_unit(batch["tm2"], CLIP_TARGETS)) ** 2
+        )
+        losses["tm"] = 0.5 * (tm1 + tm2)
 
-def train_on_buffer(student, teacher, optimizer, groups, cache, epoch, buffer_idx):
+    total = balancer(losses)
+    return total, {name: float(value.detach()) for name, value in losses.items()}
+
+
+def train_on_buffer(student, teacher, balancer, optimizer, groups, cache, epoch, buffer_idx):
     dataset = make_dataset(groups, cache, EXTRA_DISTILL_RESIDUES)
     loader = DataLoader(
         dataset,
@@ -270,12 +296,14 @@ def train_on_buffer(student, teacher, optimizer, groups, cache, epoch, buffer_id
 
             student_out = student_forward(student, batch)
             loss, parts = compute_losses(
-                student_out, teacher_z1, teacher_z2, batch, teacher=teacher
+                student_out, teacher_z1, teacher_z2, batch, balancer, teacher=teacher
             )
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=GRAD_CLIP)
+            torch.nn.utils.clip_grad_norm_(
+                list(student.parameters()) + list(balancer.parameters()), max_norm=GRAD_CLIP
+            )
             optimizer.step()
 
             n = batch["tm"].shape[0]
@@ -292,7 +320,8 @@ def train_on_buffer(student, teacher, optimizer, groups, cache, epoch, buffer_id
                     f"(distill={totals['distill'] / max(examples, 1):.4f} "
                     f"global={totals['global'] / max(examples, 1):.4f} "
                     f"fgw={totals['fgw'] / max(examples, 1):.4f} "
-                    f"tm={totals['tm'] / max(examples, 1):.4f})"
+                    f"tm={totals['tm'] / max(examples, 1):.4f}) "
+                    f"[{balancer.describe()}]"
                 )
         except Exception as exc:
             skipped += 1
@@ -310,7 +339,9 @@ def train_on_buffer(student, teacher, optimizer, groups, cache, epoch, buffer_id
 @torch.no_grad()
 def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
     student.eval()
-    fgw_pred, fgw_true, tm_pred, tm_true, agreement = [], [], [], [], []
+    fgw_pred, fgw_true = [], []
+    tm_pred, tm_true, tm2_pred, tm2_true = [], [], [], []
+    agreement = []
 
     for groups in iter_group_buffers(
         FGW_CSV,
@@ -333,11 +364,13 @@ def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
                 out = student_forward(student, batch)
                 mask = batch["pair_mask"]
 
-                fgw_pred.append(out["cosine_similarity"][mask].cpu().numpy())
+                fgw_pred.append(out["local_similarity"][mask].cpu().numpy())
                 fgw_true.append(fgw_target(batch, FGW_TARGET, CLIP_TARGETS)[mask].cpu().numpy())
                 if "tm_score_pred" in out:
                     tm_pred.append(out["tm_score_pred"].cpu().numpy())
                     tm_true.append(clip_unit(batch["tm"], CLIP_TARGETS).cpu().numpy())
+                    tm2_pred.append(out["tm_score_pred2"].cpu().numpy())
+                    tm2_true.append(clip_unit(batch["tm2"], CLIP_TARGETS).cpu().numpy())
 
                 for side, key in (("1", "residue_z1"), ("2", "residue_z2")):
                     reference = teacher_embeddings(teacher, batch, side)
@@ -353,6 +386,7 @@ def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
     metrics = {"fgw": summarise(fgw_pred, fgw_true)}
     if tm_pred:
         metrics["tm"] = summarise(tm_pred, tm_true)
+        metrics["tm2"] = summarise(tm2_pred, tm2_true)
     if agreement:
         metrics["agreement"] = float(np.concatenate(agreement).mean())
     return metrics
@@ -362,7 +396,7 @@ def load_teacher():
     if not os.path.exists(TEACHER_CHECKPOINT):
         raise FileNotFoundError(TEACHER_CHECKPOINT)
 
-    checkpoint = torch.load(TEACHER_CHECKPOINT, map_location=DEVICE)
+    checkpoint = torch.load(TEACHER_CHECKPOINT, map_location=DEVICE, weights_only=False)
     config = checkpoint["config"]
 
     teacher = SiameseEGNNTeacher(
@@ -370,6 +404,8 @@ def load_teacher():
         hidden_dim=config["hidden_dim"],
         output_dim=config["output_dim"],
         num_layers=config["num_layers"],
+        num_rbf=config.get("num_rbf", 16),
+        rbf_max_distance=config.get("rbf_max_distance", 20.0),
         dropout=0.0,
         use_tm_head=config.get("use_tm_head", False),
     ).to(DEVICE)
@@ -393,12 +429,21 @@ def load_teacher():
             f"notion of similarity than the student's own FGW loss."
         )
 
+    teacher_scale = config.get("gw_label_scale")
+    if teacher_scale is not None and teacher_scale != GW_LABEL_SCALE:
+        log(
+            f"WARNING: teacher was trained with gw_label_scale={teacher_scale} "
+            f"but fgw.py now sets {GW_LABEL_SCALE}. Its cosine similarities are "
+            f"calibrated to a different label; retrain it or match the scale."
+        )
+
     log(f"loaded teacher from epoch {checkpoint.get('epoch')}")
     return teacher, config
 
 
 def save_checkpoint(
     student,
+    balancer,
     optimizer,
     epoch,
     loss,
@@ -408,6 +453,7 @@ def save_checkpoint(
     epoch_loss=0.0,
     epoch_examples=0,
     best_val=float("inf"),
+    epoch_complete=False,
 ):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     name = name or f"student_epoch_{epoch:03d}.pt"
@@ -417,7 +463,9 @@ def save_checkpoint(
         {
             "epoch": epoch,
             "buffer_idx": buffer_idx,
+            "epoch_complete": epoch_complete,
             "model_state_dict": student.state_dict(),
+            "balancer_state_dict": balancer.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "loss": loss,
             "epoch_loss": epoch_loss,
@@ -434,6 +482,9 @@ def save_checkpoint(
                 "max_length": MAX_SEQ_LENGTH + 24,
                 "use_tm_head": W_TM > 0,
                 "fgw_target": FGW_TARGET,
+                "gw_label_scale": GW_LABEL_SCALE,
+                "fgw_label_scale": FGW_LABEL_SCALE,
+                "loss_balance": LOSS_BALANCE,
                 "extra_distill_residues": EXTRA_DISTILL_RESIDUES,
                 "teacher_checkpoint": TEACHER_CHECKPOINT,
             },
@@ -453,9 +504,12 @@ def main():
     log(f"Protein pairs per batch: {BATCH_SIZE}")
     log(
         f"Loss weights: distill={W_DISTILL} global={W_GLOBAL} "
-        f"fgw={W_FGW} tm={W_TM}"
+        f"fgw={W_FGW} tm={W_TM} (balance={LOSS_BALANCE})"
     )
-    log(f"FGW target: {FGW_TARGET}")
+    log(
+        f"FGW target: {FGW_TARGET} (label scales: structure={GW_LABEL_SCALE}, "
+        f"composite={FGW_LABEL_SCALE})"
+    )
     log(f"Extra distillation residues: {EXTRA_DISTILL_RESIDUES} per protein")
     log(f"Split: {split_summary()}")
 
@@ -479,10 +533,13 @@ def main():
         max_length=MAX_SEQ_LENGTH + 24,
         use_tm_head=W_TM > 0,
     ).to(DEVICE)
+    balancer = build_balancer().to(DEVICE)
     log("student loaded onto device")
 
     optimizer = torch.optim.AdamW(
-        student.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        list(student.parameters()) + list(balancer.parameters()),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
 
     (
@@ -492,7 +549,7 @@ def main():
         resume_loss,
         resume_examples,
         best_val,
-    ) = load_resume_state(student, optimizer)
+    ) = load_resume_state(student, balancer, optimizer)
 
     for epoch in range(start_epoch, EPOCHS + 1):
         log(f"===== epoch {epoch}/{EPOCHS} =====")
@@ -516,7 +573,7 @@ def main():
             buffer_idx += 1
             log(f"epoch {epoch}: buffer {buffer_idx} ({len(groups)} protein pairs)")
             buffer_loss, n = train_on_buffer(
-                student, teacher, optimizer, groups, cache, epoch, buffer_idx
+                student, teacher, balancer, optimizer, groups, cache, epoch, buffer_idx
             )
             epoch_loss += buffer_loss * n
             epoch_examples += n
@@ -527,9 +584,12 @@ def main():
                     f"epoch {epoch} buffer {buffer_idx}:",
                 )
 
-            if CHECKPOINT_EVERY_BUFFERS and buffer_idx % CHECKPOINT_EVERY_BUFFERS == 0:
+            if (
+                CHECKPOINT_EVERY_BUFFERS and buffer_idx % CHECKPOINT_EVERY_BUFFERS == 0
+            ) or STOP_REQUESTED:
                 path = save_checkpoint(
                     student,
+                    balancer,
                     optimizer,
                     epoch,
                     epoch_loss / max(epoch_examples, 1),
@@ -542,18 +602,7 @@ def main():
                 log(f"epoch {epoch} buffer {buffer_idx}: saved {path}")
 
             if STOP_REQUESTED:
-                path = save_checkpoint(
-                    student,
-                    optimizer,
-                    epoch,
-                    epoch_loss / max(epoch_examples, 1),
-                    name=LATEST_CHECKPOINT_NAME,
-                    buffer_idx=buffer_idx,
-                    epoch_loss=epoch_loss,
-                    epoch_examples=epoch_examples,
-                    best_val=best_val,
-                )
-                log(f"stopped after epoch {epoch} buffer {buffer_idx}: saved {path}")
+                log(f"stopped after epoch {epoch} buffer {buffer_idx}")
                 log("resubmit the same command to continue from here")
                 return
 
@@ -567,12 +616,7 @@ def main():
         log(f"epoch {epoch} finished: train loss={avg_loss:.6f}")
         log_validation(val_metrics, f"epoch {epoch}:")
         log(f"protein cache hit rate: {cache.hit_rate():.1%}")
-
-        path = save_checkpoint(
-            student, optimizer, epoch, avg_loss, val_metrics=val_metrics,
-            buffer_idx=0, best_val=best_val,
-        )
-        log(f"saved checkpoint: {path}")
+        log(f"effective loss weights: {balancer.describe()}")
 
         if val_metrics is not None:
             score = val_metrics["fgw"]["mse"]
@@ -582,13 +626,32 @@ def main():
                 best_val = score
                 best_path = save_checkpoint(
                     student,
+                    balancer,
                     optimizer,
                     epoch,
                     avg_loss,
                     name="student_best.pt",
                     val_metrics=val_metrics,
+                    best_val=best_val,
+                    epoch_complete=True,
                 )
                 log(f"new best validation score {score:.6f}: saved {best_path}")
+
+        # the numbered checkpoint and the latest one: both mark the epoch as
+        # complete, so a resume starts the next epoch instead of redoing this one
+        for name in (None, LATEST_CHECKPOINT_NAME):
+            path = save_checkpoint(
+                student,
+                balancer,
+                optimizer,
+                epoch,
+                avg_loss,
+                name=name,
+                val_metrics=val_metrics,
+                best_val=best_val,
+                epoch_complete=True,
+            )
+            log(f"saved checkpoint: {path}")
 
     log("done")
 

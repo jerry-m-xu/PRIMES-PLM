@@ -73,6 +73,23 @@ def proper_rotation(seed=0):
     return q.astype(np.float32)
 
 
+def ideal_helix(num_residues=16):
+    """Alpha-helix CA trace: 2.3 A radius, 100 degrees and 1.5 A rise per residue."""
+    angle = np.arange(num_residues) * np.deg2rad(100.0)
+    return np.stack(
+        [2.3 * np.cos(angle), 2.3 * np.sin(angle), 1.5 * np.arange(num_residues)],
+        axis=1,
+    ).astype(np.float32)
+
+
+def compact_patch(num_residues=16, seed=0):
+    """Random points in a ~12 A ball, compact like a real k-NN patch."""
+    rng = np.random.default_rng(seed)
+    points = rng.normal(size=(num_residues * 4, 3))
+    points = points[np.linalg.norm(points, axis=1) < 1.5][:num_residues]
+    return (points * 8.0).astype(np.float32)
+
+
 class TestPatchDefinition(unittest.TestCase):
     def test_center_residue_comes_first(self):
         """The encoder reads the patch centre from index 0."""
@@ -292,31 +309,67 @@ class TestAlignedResiduePairs(unittest.TestCase):
 
 @needs_fgw
 class TestFgwProperties(unittest.TestCase):
-    PARAMS = dict(alpha=0.7, eps=0.05, sinkhorn_iter=10, structure_exp_scale=0.1)
+    """The label is a raw GW distortion in fgw.DIST_SCALE units.
+
+    Patches here are compact, like real k-NN patches. GW is non-convex, so
+    on unstructured random walks the solver can land in different basins
+    depending on argument order; that is a property of the problem, not a
+    bug, and the label is computed once per pair in the id1 -> id2 direction.
+    """
 
     @classmethod
     def setUpClass(cls):
         rng = np.random.default_rng(11)
-        cls.X = random_backbone(16, seed=20)
-        cls.Y = random_backbone(16, seed=21)
+        cls.X = compact_patch(16, seed=1)
+        cls.Y = compact_patch(16, seed=2)
+        cls.H = ideal_helix(16)
         cls.F1 = rng.normal(size=(16, 32))
         cls.F2 = rng.normal(size=(16, 32))
 
-    def test_identical_patches_have_near_zero_distance(self):
-        self.assertLess(
-            fgw.compute_fgw_from_features(self.X, self.X, self.F1, self.F1, **self.PARAMS),
-            0.05,
+    def assertRelativelyClose(self, first, second, tolerance):
+        self.assertLess(abs(first - second), tolerance * max(abs(first), abs(second)))
+
+    def test_identical_patches_have_zero_distortion(self):
+        for patch in (self.X, self.H):
+            self.assertLess(fgw.compute_structure_gw(patch, patch), 1e-3)
+
+    def test_structure_label_ignores_features(self):
+        """Same structure, rotated, unrelated features: still ~0.
+
+        Training pairs live here (remote homologues never share ESM
+        features). The old fused label fell to ~0.2 in this case, because
+        the feature term steered the coupling the structure term was read
+        from. The fused solver still does that, which is why it is only a
+        secondary score.
+        """
+        rotated = (self.X - self.X.mean(0)) @ proper_rotation(seed=3).T + 40.0
+        structure = fgw.compute_structure_gw(self.X, rotated)
+        self.assertLess(structure, 1e-3)
+
+        _, fused_structure_term, _ = fgw.compute_fgw_from_features(
+            self.X, rotated, self.F1, self.F2, return_components=True
         )
+        self.assertGreater(fused_structure_term, structure)
 
     def test_unrelated_patches_are_further(self):
-        same = fgw.compute_fgw_from_features(self.X, self.X, self.F1, self.F1, **self.PARAMS)
-        different = fgw.compute_fgw_from_features(self.X, self.Y, self.F1, self.F2, **self.PARAMS)
-        self.assertGreater(different, same + 0.1)
+        same = fgw.compute_structure_gw(self.X, self.X)
+        different = fgw.compute_structure_gw(self.X, self.Y)
+        self.assertGreater(different, same + 0.01)
+
+    def test_scaled_patch_is_not_identical(self):
+        """A shared distance unit keeps absolute size. Per-patch mean
+        normalisation used to make a 1.25x copy score as identical."""
+        self.assertGreater(fgw.compute_structure_gw(self.X, 1.25 * self.X), 1e-3)
 
     def test_distance_is_symmetric(self):
-        forward = fgw.compute_fgw_from_features(self.X, self.Y, self.F1, self.F2, **self.PARAMS)
-        backward = fgw.compute_fgw_from_features(self.Y, self.X, self.F2, self.F1, **self.PARAMS)
-        self.assertAlmostEqual(forward, backward, delta=0.02)
+        forward = fgw.compute_structure_gw(self.H, self.X)
+        backward = fgw.compute_structure_gw(self.X, self.H)
+        self.assertRelativelyClose(forward, backward, 0.1)
+
+    def test_fused_score_is_symmetric(self):
+        forward = fgw.compute_fgw_from_features(self.H, self.X, self.F1, self.F2)
+        backward = fgw.compute_fgw_from_features(self.X, self.H, self.F2, self.F1)
+        self.assertRelativelyClose(forward, backward, 0.1)
 
     def test_sinkhorn_plan_has_requested_marginals(self):
         n = 12
@@ -327,6 +380,25 @@ class TestFgwProperties(unittest.TestCase):
         self.assertAlmostEqual(plan.sum(), 1.0, places=4)
         np.testing.assert_allclose(plan.sum(axis=1), a, atol=1e-3)
         np.testing.assert_allclose(plan.sum(axis=0), b, atol=1e-3)
+
+    def test_sinkhorn_keeps_mass_at_large_cost_to_eps_ratio(self):
+        """Costs 50-100x eps: exp(-C / eps) underflows to ~1e-22 and the old
+        multiplicative solver returned a plan with ~1e-28 total mass. The
+        log-domain solver must return the requested marginals."""
+        n = 12
+        rng = np.random.default_rng(13)
+        cost = rng.uniform(5.0, 10.0, size=(n, n))
+        a = b = np.ones(n) / n
+        plan = fgw.sinkhorn(cost, a, b, eps=0.1, n_iter=300)
+        self.assertAlmostEqual(plan.sum(), 1.0, places=6)
+        np.testing.assert_allclose(plan.sum(axis=1), a, atol=1e-4)
+        np.testing.assert_allclose(plan.sum(axis=0), b, atol=1e-4)
+
+    def test_similarity_from_distortion_is_bounded_and_monotone(self):
+        self.assertEqual(fgw.similarity_from_distortion(0.0, 0.05), 1.0)
+        values = fgw.similarity_from_distortion(np.array([0.01, 0.1, 5.0]), 0.05)
+        self.assertTrue(np.all(values > 0) and np.all(values <= 1))
+        self.assertTrue(np.all(np.diff(values) < 0))
 
     def test_pairwise_dist_known_case(self):
         points = np.array([[0.0, 0, 0], [3.0, 4, 0]])
@@ -498,17 +570,19 @@ class TestPairBatching(unittest.TestCase):
         )
         handle.write(
             "tm_data_row,id1,id2,residue_idx1,residue_idx2,"
-            "fgw_score,fgw_structure_term,tm_score_norm1\n"
+            "gw_raw,fgw_raw,tm_term,pair_type,tm_score_norm1,tm_score_norm2\n"
         )
         rng = np.random.default_rng(80)
         for pair_idx in range(self.num_pairs):
             tm = rng.random()
-            for _ in range(self.rows_per_pair):
+            for row_idx in range(self.rows_per_pair):
+                pair_type = pair_data.PAIR_TYPES[row_idx % len(pair_data.PAIR_TYPES)]
                 handle.write(
                     f"{pair_idx},A{pair_idx:03d},B{pair_idx:03d},"
                     f"{rng.integers(0, self.NUM_RESIDUES)},"
                     f"{rng.integers(0, self.NUM_RESIDUES)},"
-                    f"{rng.random():.4f},{rng.random():.4f},{tm:.4f}\n"
+                    f"{rng.random() * 0.2:.4f},{rng.random() * 0.2:.4f},"
+                    f"{rng.random():.4f},{pair_type},{tm:.4f},{tm * 0.9:.4f}\n"
                 )
         handle.close()
         self.csv = handle.name
@@ -578,13 +652,21 @@ class TestPairBatching(unittest.TestCase):
         self.assertEqual(batch["features1"].shape[-1], self.FEATURE_DIM)
         self.assertEqual(batch["seq_mask1"].sum().item(), 2 * self.NUM_RESIDUES)
 
-    def test_structure_target_is_the_flipped_structure_term(self):
-        """The structure-only target must be a similarity, like fgw_score."""
+    def test_targets_are_exp_of_the_raw_distortions(self):
+        """The CSV holds raw distortions; the loader maps them into (0, 1]."""
         groups = self.groups(1000)[:1]
         dataset = pair_data.ProteinPairDataset(groups, self.make_cache())
         item = dataset[0]
-        expected = 1.0 - groups[0]["fgw_structure_term"].to_numpy()
-        np.testing.assert_allclose(item["fgw_structure"], expected, atol=1e-6)
+        expected_structure = np.exp(
+            -groups[0]["gw_raw"].to_numpy() / pair_data.GW_LABEL_SCALE
+        )
+        expected_composite = np.exp(
+            -groups[0]["fgw_raw"].to_numpy() / pair_data.FGW_LABEL_SCALE
+        )
+        np.testing.assert_allclose(item["fgw_structure"], expected_structure, rtol=1e-5)
+        np.testing.assert_allclose(item["fgw"], expected_composite, rtol=1e-5)
+        self.assertTrue(np.all(item["fgw_structure"] > 0))
+        self.assertTrue(np.all(item["fgw_structure"] <= 1))
 
     def test_select_fgw_target_picks_the_right_column(self):
         groups = self.groups(1000)[:2]
@@ -715,6 +797,346 @@ class TestPairBatching(unittest.TestCase):
         self.assertAlmostEqual(
             pair_data.masked_mse(predictions, targets, mask).item(), 2.0, places=5
         )
+
+
+def write_fake_pdb(path, coords):
+    """One CA per residue, all alanine, chain A."""
+    with open(path, "w") as handle:
+        for index, (x, y, z) in enumerate(coords, start=1):
+            handle.write(
+                f"ATOM  {index:5d}  CA  ALA A{index:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C\n"
+            )
+        handle.write("END\n")
+
+
+class TestParquetStreaming(unittest.TestCase):
+    def setUp(self):
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError:  # pragma: no cover
+            self.skipTest("pyarrow not installed")
+
+    def test_window_and_batches_agree_with_row_indices(self):
+        import tempfile
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pa.table({"a": [f"A{i}" for i in range(12)], "b": list(range(12))})
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "t.parquet")
+            pq.write_table(table, path, row_group_size=5)  # groups of 5, 5, 2
+            parquet_file = pq.ParquetFile(path)
+            self.assertEqual(parquet_file.num_row_groups, 3)
+
+            rows = list(common.iter_parquet_rows(parquet_file, ["a", "b"], 3, 9, batch_size=2))
+            self.assertEqual([index for index, _ in rows], list(range(3, 9)))
+            self.assertEqual([row["b"] for _, row in rows], list(range(3, 9)))
+            self.assertEqual(rows[0][1]["a"], "A3")
+
+            everything = list(common.iter_parquet_rows(parquet_file, ["b"], 0, None))
+            self.assertEqual(len(everything), 12)
+
+
+class TestSuperposition(unittest.TestCase):
+    def test_round_trip(self):
+        translation = [1.5, -2.0, 3.25]
+        rotation = np.eye(3)
+        text = common.format_superposition(translation, rotation)
+        self.assertEqual(len(text.split()), 12)
+        t, u = common.parse_superposition(text)
+        np.testing.assert_allclose(t, translation)
+        np.testing.assert_allclose(u, rotation)
+
+    def test_rejects_wrong_length(self):
+        with self.assertRaises(ValueError):
+            common.parse_superposition("1 2 3")
+
+
+@needs_fgw
+class TestLocalLabelSampling(unittest.TestCase):
+    def test_tm_d0_matches_tm_align(self):
+        self.assertEqual(fgw_data.tm_d0(10), 0.5)
+        self.assertAlmostEqual(fgw_data.tm_d0(141), 1.24 * 126 ** (1 / 3) - 1.8, places=6)
+
+    def test_tm_term_is_one_at_zero_distance(self):
+        self.assertEqual(fgw_data.tm_term(0.0, 4.0), 1.0)
+        self.assertAlmostEqual(fgw_data.tm_term(4.0, 4.0), 0.5)
+
+    def test_negatives_are_off_path_and_alternate_types(self):
+        aligned = [(k, k, k + 3, "A", ":", "A") for k in range(100)]  # i -> i + 3
+        rng = np.random.default_rng(0)
+        with module_globals(fgw_data, ALIGNED_RESIDUE_STRIDE=10, NEGATIVES_PER_POSITIVE=1):
+            sampled = fgw_data.sample_residue_pairs(aligned, 100, 110, rng)
+
+        positives = [p for p in sampled if p[0] == "aligned"]
+        negatives = [p for p in sampled if p[0] != "aligned"]
+        self.assertEqual(len(positives), 10)
+        self.assertEqual(len(negatives), 10)
+        self.assertEqual([p[0] for p in negatives][:4], ["shifted", "random", "shifted", "random"])
+
+        on_path = {(i, j) for _, i, j, _, _, _ in aligned}
+        for pair_type, align_pos, i, j, marker in negatives:
+            self.assertNotIn((i, j), on_path)
+            self.assertEqual(align_pos, -1)
+            self.assertTrue(0 <= i < 100 and 0 <= j < 110)
+        for (_, _, i, j, _), (kind, _, ni, nj, _) in zip(positives, negatives):
+            if kind == "shifted":
+                self.assertEqual(ni, i)
+                self.assertTrue(fgw_data.SHIFT_RANGE[0] <= abs(nj - j) <= fgw_data.SHIFT_RANGE[1])
+
+    def test_sampling_is_deterministic_per_source_row(self):
+        aligned = [(k, k, k, "A", ":", "A") for k in range(64)]
+        first = fgw_data.sample_residue_pairs(aligned, 64, 64, np.random.default_rng(5))
+        second = fgw_data.sample_residue_pairs(aligned, 64, 64, np.random.default_rng(5))
+        self.assertEqual(first, second)
+
+    def test_process_tm_row_end_to_end(self):
+        """Fake PDBs, a rotated copy, identity alignment: aligned pairs get a
+        superposed distance of ~0 and a TM term of ~1; negatives are written."""
+        try:
+            import Bio  # noqa: F401
+        except ImportError:  # pragma: no cover
+            self.skipTest("biopython not installed")
+        import csv
+        import tempfile
+
+        num_residues = 40
+        coords1 = compact_patch(num_residues, seed=9).astype(np.float64)
+        rotation = proper_rotation(seed=9).astype(np.float64)
+        translation = np.array([4.0, -7.0, 2.5])
+        coords2 = coords1 @ rotation.T + translation
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdb_dir = os.path.join(directory, "pdbs")
+            emb_dir = os.path.join(directory, "emb")
+            os.makedirs(pdb_dir)
+            os.makedirs(emb_dir)
+            write_fake_pdb(os.path.join(pdb_dir, "X1.pdb"), coords1)
+            write_fake_pdb(os.path.join(pdb_dir, "X2.pdb"), coords2)
+            rng = np.random.default_rng(1)
+            for name in ("X1", "X2"):
+                np.save(
+                    os.path.join(emb_dir, f"{name}.npy"),
+                    rng.normal(size=(num_residues, 8)).astype(np.float16),
+                )
+
+            row = {
+                "row": 3, "id1": "X1", "id2": "X2",
+                "tm_score_norm1": 1.0, "tm_score_norm2": 1.0,
+                "seqxA": "A" * num_residues, "seqM": ":" * num_residues,
+                "seqyA": "A" * num_residues,
+                "superposition": common.format_superposition(translation, rotation),
+            }
+            out_path = os.path.join(directory, "out.csv")
+            with open(out_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fgw_data.output_fields())
+                writer.writeheader()
+                with module_globals(fgw_data, PDB_DIR=pdb_dir, EMBEDDING_DIR=emb_dir):
+                    written = fgw_data.process_tm_row(row, 3, writer)
+
+            with open(out_path, newline="") as handle:
+                records = list(csv.DictReader(handle))
+
+        positives = [r for r in records if r["pair_type"] == "aligned"]
+        negatives = [r for r in records if r["pair_type"] != "aligned"]
+        self.assertEqual(written, len(records))
+        self.assertEqual(len(positives), -(-num_residues // fgw_data.ALIGNED_RESIDUE_STRIDE))
+        self.assertEqual(len(negatives), len(positives) * fgw_data.NEGATIVES_PER_POSITIVE)
+        for record in positives:
+            self.assertLess(float(record["superposed_dist"]), 1e-2)
+            self.assertGreater(float(record["tm_term"]), 0.999)
+            self.assertLess(float(record["gw_raw"]), 1e-3)
+            self.assertEqual(record["residue_idx1"], record["residue_idx2"])
+        for record in negatives:
+            self.assertIn(record["pair_type"], ("shifted", "random"))
+            self.assertNotEqual(record["residue_idx1"], record["residue_idx2"])
+            self.assertEqual(record["align_pos"], "-1")
+        self.assertEqual(set(records[0]) , set(fgw_data.output_fields()))
+
+
+class TestClusterSplit(unittest.TestCase):
+    def test_members_of_a_cluster_share_a_split(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "clusters.tsv")
+            with open(path, "w") as handle:
+                handle.write("REP1\tREP1\nREP1\tP00001\nREP1\tP00002\nREP2\tP00003\n")
+            with module_globals(splits, CLUSTER_TSV=path, _CLUSTER_MAP=None):
+                self.assertEqual(splits.split_key("P00001"), "REP1")
+                self.assertEqual(splits.split_key("P99999"), "P99999")  # not in the map
+                expected = splits.bucket_split(splits.stable_bucket("REP1"))
+                self.assertEqual(splits.protein_split("P00001"), expected)
+                self.assertEqual(splits.protein_split("P00002"), expected)
+                self.assertIn("clusters", splits.split_summary())
+
+    def test_missing_map_falls_back_to_ids(self):
+        with module_globals(splits, CLUSTER_TSV="/nonexistent/clusters.tsv", _CLUSTER_MAP=None):
+            self.assertEqual(splits.split_key("P00001"), "P00001")
+            self.assertIn("NO cluster map", splits.split_summary())
+
+
+@needs_torch
+class TestModelComponents(unittest.TestCase):
+    def test_radial_basis_is_unit_scale(self):
+        basis = egnn_model.RadialBasis(num_rbf=8, max_distance=10.0)
+        out = basis(torch.tensor([[0.0], [10.0], [400.0]]))
+        self.assertEqual(tuple(out.shape), (3, 8))
+        self.assertTrue(torch.all(out >= 0) and torch.all(out <= 1))
+        self.assertAlmostEqual(out[0, 0].item(), 1.0, places=5)
+        self.assertAlmostEqual(out[1, -1].item(), 1.0, places=5)
+
+    def test_calibration_starts_at_half_cosine_plus_half(self):
+        calibration = egnn_model.SimilarityCalibration()
+        out = calibration(torch.tensor([1.0, 0.0, -1.0]))
+        np.testing.assert_allclose(out.detach().numpy(), [1.0, 0.5, 0.0])
+        self.assertEqual(len(list(calibration.parameters())), 2)
+
+    def test_teacher_reports_calibrated_similarity(self):
+        torch.manual_seed(0)
+        model = egnn_model.SiameseEGNNTeacher(
+            input_dim=6, hidden_dim=16, output_dim=8, num_layers=1, num_rbf=4
+        ).eval()
+        rng = np.random.default_rng(3)
+        features = torch.from_numpy(rng.normal(size=(1, 2, 5, 6)).astype(np.float32))
+        coords = torch.from_numpy(rng.normal(size=(1, 2, 5, 3)).astype(np.float32) * 4)
+        mask = torch.ones(1, 2, 5, dtype=torch.bool)
+        with torch.no_grad():
+            out = model.forward_protein_pair(
+                features, coords, features, coords, mask, mask, torch.ones(1, 2, dtype=torch.bool)
+            )
+        np.testing.assert_allclose(
+            out["local_similarity"].numpy(), (0.5 * out["cosine_similarity"] + 0.5).numpy(), atol=1e-6
+        )
+
+    def test_loss_balancer_modes(self):
+        import losses
+
+        terms = {"fgw": torch.tensor(0.02), "tm": torch.tensor(0.5)}
+        fixed = losses.LossBalancer({"fgw": 1.0, "tm": 0.2}, mode="fixed")
+        self.assertAlmostEqual(fixed(terms).item(), 0.02 + 0.1, places=6)
+
+        balanced = losses.LossBalancer({"fgw": 1.0, "tm": 0.2}, mode="uncertainty")
+        self.assertAlmostEqual(balanced(terms).item(), 0.02 + 0.1, places=6)  # s = 0 at init
+        with torch.no_grad():
+            balanced.log_variances[0] = float(np.log(4.0))
+        self.assertAlmostEqual(balanced.effective_weights()["fgw"], 0.25, places=6)
+        expected = 1.0 * (0.02 / 4 + np.log(4.0)) + 0.2 * 0.5
+        self.assertAlmostEqual(balanced(terms).item(), expected, places=5)
+
+        # a missing or zero-weighted term is skipped, never an error
+        self.assertAlmostEqual(fixed({"fgw": torch.tensor(0.02)}).item(), 0.02, places=6)
+        zero = losses.LossBalancer({"fgw": 1.0, "tm": 0.0}, mode="fixed")
+        self.assertAlmostEqual(zero(terms).item(), 0.02, places=6)
+        with self.assertRaises(ValueError):
+            fixed({})
+
+    def test_similarity_statistics_ignore_padding(self):
+        rng = np.random.default_rng(4)
+        z = torch.nn.functional.normalize(
+            torch.from_numpy(rng.normal(size=(1, 6, 8)).astype(np.float32)), dim=-1
+        )
+        full = torch.ones(1, 6, dtype=torch.bool)
+        stats = student_module.similarity_statistics(torch.bmm(z, z.transpose(1, 2)), full, full)
+        self.assertEqual(tuple(stats.shape), (1, 5))
+        np.testing.assert_allclose(stats[0, :2].numpy(), [1.0, 1.0], atol=1e-5)  # self-match
+
+        padded = torch.cat([z, torch.zeros(1, 3, 8)], dim=1)
+        mask = torch.cat([full, torch.zeros(1, 3, dtype=torch.bool)], dim=1)
+        stats_padded = student_module.similarity_statistics(
+            torch.bmm(padded, padded.transpose(1, 2)), mask, mask
+        )
+        np.testing.assert_allclose(stats_padded.numpy(), stats.numpy(), atol=1e-5)
+
+    def make_student(self):
+        torch.manual_seed(2)
+        return student_module.SequenceStudent(
+            input_dim=6, hidden_dim=16, output_dim=8, num_layers=1, num_heads=2,
+            ff_dim=16, dropout=0.0, max_length=64, use_tm_head=True,
+        ).eval()
+
+    def student_batch(self, length1, length2, slots1, slots2, seed=5):
+        rng = np.random.default_rng(seed)
+        features1 = torch.zeros(1, slots1, 6)
+        features2 = torch.zeros(1, slots2, 6)
+        features1[:, :length1] = torch.from_numpy(rng.normal(size=(1, length1, 6)).astype(np.float32))
+        features2[:, :length2] = torch.from_numpy(rng.normal(size=(1, length2, 6)).astype(np.float32))
+        mask1 = torch.zeros(1, slots1, dtype=torch.bool)
+        mask2 = torch.zeros(1, slots2, dtype=torch.bool)
+        mask1[:, :length1] = True
+        mask2[:, :length2] = True
+        residue_idx = torch.tensor([[0, 3, 5]])
+        return features1, mask1, residue_idx, features2, mask2, residue_idx
+
+    def test_student_predicts_both_tm_normalisations_and_ignores_padding(self):
+        student = self.make_student()
+        with torch.no_grad():
+            tight = student.forward_pair(*self.student_batch(9, 7, 9, 7), pair_mask=torch.ones(1, 3, dtype=torch.bool))
+            loose = student.forward_pair(*self.student_batch(9, 7, 20, 15), pair_mask=torch.ones(1, 3, dtype=torch.bool))
+
+        for key in ("tm_score_pred", "tm_score_pred2", "local_similarity", "similarity_matrix", "similarity_stats"):
+            self.assertIn(key, tight)
+        self.assertEqual(tuple(tight["similarity_matrix"].shape), (1, 9, 7))
+        self.assertTrue(0.0 <= tight["tm_score_pred"].item() <= 1.0)
+        self.assertTrue(0.0 <= tight["tm_score_pred2"].item() <= 1.0)
+        self.assertNotAlmostEqual(tight["tm_score_pred"].item(), tight["tm_score_pred2"].item(), places=6)
+
+        np.testing.assert_allclose(loose["tm_score_pred"].numpy(), tight["tm_score_pred"].numpy(), atol=1e-4)
+        np.testing.assert_allclose(loose["tm_score_pred2"].numpy(), tight["tm_score_pred2"].numpy(), atol=1e-4)
+        np.testing.assert_allclose(loose["local_similarity"].numpy(), tight["local_similarity"].numpy(), atol=1e-4)
+
+    def test_student_length_changes_the_tm_prediction(self):
+        """The global head must see length: the same residues padded is not the
+        same protein made longer."""
+        student = self.make_student()
+        short = self.student_batch(9, 7, 9, 7)
+        longer = self.student_batch(9, 7, 9, 7)
+        with torch.no_grad():
+            base = student.forward_pair(*short)["tm_score_pred"].item()
+            # append real residues to protein 1
+            features1 = torch.cat([longer[0], torch.randn(1, 12, 6)], dim=1)
+            mask1 = torch.ones(1, 21, dtype=torch.bool)
+            changed = student.forward_pair(features1, mask1, longer[2], *longer[3:])["tm_score_pred"].item()
+        self.assertNotAlmostEqual(base, changed, places=4)
+
+
+@needs_torch
+class TestResumeBookkeeping(unittest.TestCase):
+    def test_epoch_complete_checkpoint_starts_the_next_epoch(self):
+        import tempfile
+
+        import train_teacher as trainer
+
+        model = egnn_model.SiameseEGNNTeacher(
+            input_dim=4, hidden_dim=8, output_dim=4, num_layers=1, num_rbf=4, use_tm_head=True
+        )
+        balancer = trainer.build_balancer()
+        optimizer = torch.optim.AdamW(list(model.parameters()) + list(balancer.parameters()))
+
+        with tempfile.TemporaryDirectory() as directory:
+            with module_globals(trainer, CHECKPOINT_DIR=directory, RESUME=True, RESUME_PATH=None):
+                trainer.save_checkpoint(
+                    model, balancer, optimizer, epoch=3, loss=0.1,
+                    name=trainer.LATEST_CHECKPOINT_NAME, buffer_idx=0,
+                    best_val=0.5, epoch_complete=True,
+                )
+                state = trainer.load_resume_state(model, balancer, optimizer)
+                self.assertEqual(state[:3], (4, 0, 0))
+                self.assertEqual(state[4], 0)
+                self.assertEqual(state[5], 0.5)
+
+                trainer.save_checkpoint(
+                    model, balancer, optimizer, epoch=3, loss=0.1,
+                    name=trainer.LATEST_CHECKPOINT_NAME, buffer_idx=7,
+                    epoch_loss=12.0, epoch_examples=100, best_val=0.5,
+                )
+                state = trainer.load_resume_state(model, balancer, optimizer)
+                self.assertEqual(state[0], 3)
+                self.assertEqual(state[1], 7 * trainer.GROUPS_PER_BUFFER)
+                self.assertEqual(state[2], 7)
+                self.assertEqual(state[3:5], (12.0, 100))
 
 
 if __name__ == "__main__":

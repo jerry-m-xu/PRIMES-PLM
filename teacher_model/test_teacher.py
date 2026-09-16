@@ -20,9 +20,11 @@ from common import log  # noqa: E402
 from metrics import (  # noqa: E402
     report,
     report_by_bucket,
+    report_by_group,
     report_esm_baseline,
 )
 from pair_data import (  # noqa: E402
+    PAIR_TYPES,
     ProteinDataCache,
     ProteinPairDataset,
     clip_unit,
@@ -57,7 +59,7 @@ def load_model(checkpoint_path):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(checkpoint_path)
 
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     config = checkpoint["config"]
 
     model = SiameseEGNNTeacher(
@@ -65,6 +67,8 @@ def load_model(checkpoint_path):
         hidden_dim=config["hidden_dim"],
         output_dim=config["output_dim"],
         num_layers=config["num_layers"],
+        num_rbf=config.get("num_rbf", 16),
+        rbf_max_distance=config.get("rbf_max_distance", 20.0),
         dropout=0.0,
         use_tm_head=config.get("use_tm_head", False),
     ).to(DEVICE)
@@ -75,8 +79,8 @@ def load_model(checkpoint_path):
 
 @torch.no_grad()
 def evaluate(model, cache):
-    fgw_pred, tm_pred, tm_true = [], [], []
-    targets = {"structure": [], "composite": []}
+    fgw_pred, tm_pred, tm_true, pair_types = [], [], [], []
+    targets = {"structure": [], "composite": [], "tm_term": []}
     esm_baseline = []
     skipped = 0
     buffer_idx = 0
@@ -106,13 +110,15 @@ def evaluate(model, cache):
                 outputs = forward_batch(model, batch)
                 mask = batch["pair_mask"]
 
-                fgw_pred.append(outputs["cosine_similarity"][mask].cpu().numpy())
+                fgw_pred.append(outputs["local_similarity"][mask].cpu().numpy())
                 targets["structure"].append(
                     clip_unit(batch["fgw_structure"], CLIP_TARGETS)[mask].cpu().numpy()
                 )
                 targets["composite"].append(
                     clip_unit(batch["fgw"], CLIP_TARGETS)[mask].cpu().numpy()
                 )
+                targets["tm_term"].append(batch["tm_term"][mask].cpu().numpy())
+                pair_types.append(batch["pair_type"][mask].cpu().numpy())
                 esm_baseline.append(esm_baseline_similarity(batch)[mask].cpu().numpy())
                 if "tm_score_pred" in outputs:
                     tm_pred.append(outputs["tm_score_pred"].cpu().numpy())
@@ -127,6 +133,7 @@ def evaluate(model, cache):
     return {
         "fgw_pred": np.concatenate(fgw_pred),
         "targets": {k: np.concatenate(v) for k, v in targets.items()},
+        "pair_types": np.concatenate(pair_types),
         "esm_baseline": np.concatenate(esm_baseline),
         "tm": (np.concatenate(tm_pred), np.concatenate(tm_true)) if tm_pred else None,
         "skipped": skipped,
@@ -163,17 +170,23 @@ def main():
         predictions,
         targets["structure"],
     )
-    report("FGW composite (fgw_score, 30% ESM echo)", predictions, targets["composite"])
+    report("FGW composite (fused: 70% structure, 30% ESM cosine)", predictions, targets["composite"])
+    report("TM term (per residue pair, from TM-align's superposition)", predictions, targets["tm_term"])
 
     report_esm_baseline(results["esm_baseline"], predictions, targets)
 
     if results["tm"] is not None:
-        report("TM   (per protein pair)", *results["tm"])
+        report("TM   (per protein pair, auxiliary head)", *results["tm"])
     else:
         log("")
         log("  TM   : this checkpoint has no TM head")
 
-    report_by_bucket(predictions, targets.get(trained_on, targets["structure"]))
+    trained_targets = targets.get(trained_on, targets["structure"])
+    report_by_group(
+        predictions, trained_targets, results["pair_types"], PAIR_TYPES,
+        f"{trained_on} target by pair type (aligned = on TM-align's path)",
+    )
+    report_by_bucket(predictions, trained_targets)
     log("")
     log(f"  skipped batches  {results['skipped']}")
     log(f"  cache hit rate   {cache.hit_rate():.1%}")

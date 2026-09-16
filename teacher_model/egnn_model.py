@@ -16,14 +16,44 @@ def mlp(input_dim, hidden_dim, output_dim, num_layers=2, activation=nn.SiLU):
     return nn.Sequential(*layers)
 
 
+class RadialBasis(nn.Module):
+    """Gaussian expansion of a distance.
+
+    The edge MLP then sees a smooth unit-scale code instead of raw squared
+    angstroms (up to several hundred) next to LayerNormed features.
+    """
+
+    def __init__(self, num_rbf=16, max_distance=20.0):
+        super().__init__()
+        if num_rbf < 1:
+            raise ValueError("num_rbf must be at least 1")
+        centers = torch.linspace(0.0, max_distance, num_rbf)
+        spacing = max_distance / max(num_rbf - 1, 1)
+        self.register_buffer("centers", centers)
+        self.gamma = 1.0 / (2.0 * spacing**2)
+        self.num_rbf = num_rbf
+
+    def forward(self, distance):
+        """[..., 1] distances -> [..., num_rbf]."""
+        return torch.exp(-self.gamma * (distance - self.centers) ** 2)
+
+
 class EGNNLayer(nn.Module):
 
-    def __init__(self, hidden_dim, edge_hidden_dim=None, coord_update_scale=0.1):
+    def __init__(
+        self,
+        hidden_dim,
+        edge_hidden_dim=None,
+        coord_update_scale=0.1,
+        num_rbf=16,
+        rbf_max_distance=20.0,
+    ):
         super().__init__()
         edge_hidden_dim = edge_hidden_dim or hidden_dim
 
+        self.radial = RadialBasis(num_rbf, rbf_max_distance)
         self.edge_mlp = mlp(
-            input_dim=(2 * hidden_dim) + 1,
+            input_dim=(2 * hidden_dim) + num_rbf,
             hidden_dim=edge_hidden_dim,
             output_dim=edge_hidden_dim,
             num_layers=3,
@@ -50,9 +80,9 @@ class EGNNLayer(nn.Module):
         h_j = h[:, None, :, :].expand(batch_size, num_nodes, num_nodes, -1)
 
         rel = x[:, :, None, :] - x[:, None, :, :]
-        dist2 = (rel ** 2).sum(dim=-1, keepdim=True)
+        distance = torch.sqrt((rel**2).sum(dim=-1, keepdim=True) + 1e-8)
 
-        edge_input = torch.cat([h_i, h_j, dist2], dim=-1)
+        edge_input = torch.cat([h_i, h_j, self.radial(distance)], dim=-1)
         messages = self.edge_mlp(edge_input)
 
         eye = torch.eye(num_nodes, device=h.device, dtype=torch.bool)
@@ -92,6 +122,8 @@ class EGNNPatchEncoder(nn.Module):
         edge_hidden_dim=None,
         coord_update_scale=0.1,
         dropout=0.0,
+        num_rbf=16,
+        rbf_max_distance=20.0,
     ):
         super().__init__()
 
@@ -106,6 +138,8 @@ class EGNNPatchEncoder(nn.Module):
                     hidden_dim=hidden_dim,
                     edge_hidden_dim=edge_hidden_dim,
                     coord_update_scale=coord_update_scale,
+                    num_rbf=num_rbf,
+                    rbf_max_distance=rbf_max_distance,
                 )
                 for _ in range(num_layers)
             ]
@@ -139,7 +173,31 @@ class EGNNPatchEncoder(nn.Module):
         return F.normalize(z, dim=-1)
 
 
+class SimilarityCalibration(nn.Module):
+    """Learnable affine map from cosine similarity to the label's range.
+
+    Unit-vector cosines span [-1, 1] while the labels live in (0, 1]. Without
+    this the embedding geometry itself has to reproduce the label's exact
+    scale, which wastes half the cosine's span. Initialised to (cos + 1) / 2.
+    """
+
+    def __init__(self, scale=0.5, offset=0.5):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(float(scale)))
+        self.offset = nn.Parameter(torch.tensor(float(offset)))
+
+    def forward(self, cosine):
+        return self.scale * cosine + self.offset
+
+
 class TMScoreHead(nn.Module):
+    """The teacher's auxiliary global head, from pooled patch embeddings.
+
+    It sees only the sampled residues' patches, never coverage or length, so
+    it is a training signal for the embeddings rather than a TM predictor.
+    The student's GlobalHead is the real one.
+    """
+
     def __init__(self, embedding_dim, hidden_dim=None):
         super().__init__()
         hidden_dim = hidden_dim or embedding_dim
@@ -163,6 +221,7 @@ class SiameseEGNNTeacher(nn.Module):
         super().__init__()
         self.encoder = encoder or EGNNPatchEncoder(**encoder_kwargs)
         output_dim = encoder_kwargs.get("output_dim", 128)
+        self.calibration = SimilarityCalibration()
         self.use_tm_head = use_tm_head
         self.tm_head = TMScoreHead(output_dim) if use_tm_head else None
 
@@ -190,6 +249,7 @@ class SiameseEGNNTeacher(nn.Module):
             "z2": z2,
             "cosine_similarity": cosine_similarity,
             "cosine_distance": cosine_distance,
+            "local_similarity": self.calibration(cosine_similarity),
         }
 
     @staticmethod
@@ -210,10 +270,13 @@ class SiameseEGNNTeacher(nn.Module):
         mask2=None,
         pair_mask=None,
     ):
-        """Per-residue FGW similarities and a global TM prediction.
+        """Per-residue local similarities and an auxiliary TM prediction.
 
         features/coords: [batch, num_pairs, nodes, ...]; pair_mask marks
         which residue-pair slots are real. Pass it for any padded batch.
+        "cosine_similarity" is the raw embedding cosine (what the student is
+        distilled against); "local_similarity" is its calibrated version,
+        the quantity trained against the label.
         """
         batch_size, num_pairs = features1.shape[:2]
 
@@ -238,6 +301,7 @@ class SiameseEGNNTeacher(nn.Module):
             "z1": z1,
             "z2": z2,
             "cosine_similarity": cosine_similarity,
+            "local_similarity": self.calibration(cosine_similarity),
             "global_z1": g1,
             "global_z2": g2,
         }
