@@ -799,14 +799,37 @@ class TestPairBatching(unittest.TestCase):
         )
 
 
-def write_fake_pdb(path, coords):
-    """One CA per residue, all alanine, chain A."""
+def pdb_atom_line(serial, resname, chain, resseq, xyz):
+    x, y, z = xyz
+    return (
+        f"ATOM  {serial:5d}  CA  {resname} {chain}{resseq:4d}    "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C\n"
+    )
+
+
+def write_fake_pdb(path, coords, chain="A", resname="ALA"):
+    """One CA per residue, one chain."""
+    write_multichain_pdb(path, [(chain, coords, resname)])
+
+
+def write_multichain_pdb(path, chains, models=1):
+    """chains: [(chain_id, coords, resname)], written in order, `models` times.
+
+    Each model is wrapped in MODEL/ENDMDL when there is more than one, with
+    coordinates offset per model so the copies are distinguishable.
+    """
     with open(path, "w") as handle:
-        for index, (x, y, z) in enumerate(coords, start=1):
-            handle.write(
-                f"ATOM  {index:5d}  CA  ALA A{index:4d}    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C\n"
-            )
+        serial = 1
+        for model_idx in range(models):
+            if models > 1:
+                handle.write(f"MODEL     {model_idx + 1:4d}\n")
+            for chain_id, coords, resname in chains:
+                for resseq, xyz in enumerate(np.asarray(coords) + 100.0 * model_idx, start=1):
+                    handle.write(pdb_atom_line(serial, resname, chain_id, resseq, xyz))
+                    serial += 1
+                handle.write("TER\n")
+            if models > 1:
+                handle.write("ENDMDL\n")
         handle.write("END\n")
 
 
@@ -1137,6 +1160,76 @@ class TestResumeBookkeeping(unittest.TestCase):
                 self.assertEqual(state[1], 7 * trainer.GROUPS_PER_BUFFER)
                 self.assertEqual(state[2], 7)
                 self.assertEqual(state[3:5], (12.0, 100))
+
+
+class TestParsePdb(unittest.TestCase):
+    """The parser reads exactly one chain of the first model."""
+
+    def setUp(self):
+        try:
+            import Bio  # noqa: F401
+        except ImportError:  # pragma: no cover
+            self.skipTest("biopython not installed")
+        import tempfile
+
+        import parse_pdb
+
+        self.parse_pdb = parse_pdb
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.a = compact_patch(6, seed=30)
+        self.b = compact_patch(6, seed=31) + 50.0
+
+    def path(self, name):
+        return os.path.join(self.directory.name, name)
+
+    def test_single_chain_round_trips(self):
+        write_fake_pdb(self.path("mono.pdb"), self.a)
+        coords, sequence = self.parse_pdb.parse_pdb(self.path("mono.pdb"))
+        self.assertEqual(sequence, "A" * len(self.a))
+        self.assertEqual(coords.dtype, np.float32)
+        np.testing.assert_allclose(coords, self.a, atol=1e-3)
+
+    def test_reads_only_the_first_chain(self):
+        """A homo-dimer model must come back as one copy, not two glued together."""
+        write_multichain_pdb(self.path("dimer.pdb"), [("A", self.a, "ALA"), ("B", self.b, "GLY")])
+        coords, sequence = self.parse_pdb.parse_pdb(self.path("dimer.pdb"))
+        self.assertEqual(sequence, "A" * len(self.a))
+        np.testing.assert_allclose(coords, self.a, atol=1e-3)
+        self.assertEqual(
+            list(self.parse_pdb.chain_lengths(self.path("dimer.pdb")).items()),
+            [("A", len(self.a)), ("B", len(self.b))],
+        )
+
+    def test_chain_id_selects_a_chain(self):
+        write_multichain_pdb(self.path("dimer.pdb"), [("A", self.a, "ALA"), ("B", self.b, "GLY")])
+        coords, sequence = self.parse_pdb.parse_pdb(self.path("dimer.pdb"), chain_id="B")
+        self.assertEqual(sequence, "G" * len(self.b))
+        np.testing.assert_allclose(coords, self.b, atol=1e-3)
+        with self.assertRaises(ValueError):
+            self.parse_pdb.parse_pdb(self.path("dimer.pdb"), chain_id="Z")
+
+    def test_skips_a_leading_chain_without_standard_residues(self):
+        """Unknown residue names count as no chain, so the next chain is used."""
+        write_multichain_pdb(self.path("odd.pdb"), [("A", self.a, "UNK"), ("B", self.b, "GLY")])
+        coords, sequence = self.parse_pdb.parse_pdb(self.path("odd.pdb"))
+        self.assertEqual(sequence, "G" * len(self.b))
+        np.testing.assert_allclose(coords, self.b, atol=1e-3)
+        self.assertEqual(self.parse_pdb.chain_lengths(self.path("odd.pdb"))["A"], 0)
+
+    def test_first_model_only(self):
+        write_multichain_pdb(self.path("multi.pdb"), [("A", self.a, "ALA")], models=3)
+        coords, sequence = self.parse_pdb.parse_pdb(self.path("multi.pdb"))
+        self.assertEqual(len(sequence), len(self.a))
+        np.testing.assert_allclose(coords, self.a, atol=1e-3)
+
+    def test_empty_file_gives_empty_result(self):
+        with open(self.path("empty.pdb"), "w") as handle:
+            handle.write("END\n")
+        coords, sequence = self.parse_pdb.parse_pdb(self.path("empty.pdb"))
+        self.assertEqual(sequence, "")
+        self.assertEqual(tuple(coords.shape), (0, 3))
+        self.assertEqual(len(self.parse_pdb.chain_lengths(self.path("empty.pdb"))), 0)
 
 
 if __name__ == "__main__":
