@@ -21,18 +21,46 @@
 set -euo pipefail
 
 DATA_DIR="${DATA_DIR:-/jet/home/jxu23/OCEANDIR}"
+# Under sbatch, BASH_SOURCE is a copy in SLURM's spool directory, so the repo
+# root is taken from the submitted script's path (scontrol) or, failing that,
+# from the directory sbatch was run in. Set REPO_DIR to override.
+if [ -z "${REPO_DIR:-}" ] && [ -n "${SLURM_JOB_ID:-}" ]; then
+    _submitted="$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | sed -n 's/^ *Command=\([^ ]*\).*/\1/p' | head -1)"
+    if [ -n "$_submitted" ] && [ -f "${SLURM_SUBMIT_DIR:-.}/$_submitted" ]; then
+        _submitted="${SLURM_SUBMIT_DIR:-.}/$_submitted"
+    fi
+    if [ -f "$_submitted" ]; then
+        REPO_DIR="$(cd "$(dirname "$_submitted")/.." && pwd)"
+    else
+        REPO_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+    fi
+fi
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+if [ ! -f "$REPO_DIR/data_scripts/common.py" ]; then
+    echo "REPO_DIR=$REPO_DIR does not look like the repository (no data_scripts/common.py)." >&2
+    echo "Submit from the repository root, or set REPO_DIR=/path/to/repo." >&2
+    exit 1
+fi
 START_ROW="${START_ROW:-0}"
 END_ROW="${END_ROW:-4000000}"   # distinct proteins saturate well before this
 
 # A batch job does not inherit an interactively-activated venv. Source the
-# project setup if it is there, or point VENV at an activate script yourself.
+# project setup from the repo or the home directory, or point VENV at an
+# activate script yourself.
 if [ -n "${VENV:-}" ]; then
     # shellcheck disable=SC1090
     source "$VENV"
 elif [ -f "$REPO_DIR/psc_interactive_setup.sh" ]; then
     # shellcheck disable=SC1091
     source "$REPO_DIR/psc_interactive_setup.sh"
+elif [ -f "$HOME/psc_interactive_setup.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$HOME/psc_interactive_setup.sh"
+fi
+if ! command -v python >/dev/null 2>&1; then
+    echo "python not found after environment setup." >&2
+    echo "Set VENV=/path/to/venv/bin/activate, or put psc_interactive_setup.sh in the repo or your home directory." >&2
+    exit 1
 fi
 echo "python: $(command -v python)"
 

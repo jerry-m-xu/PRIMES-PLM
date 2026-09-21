@@ -11,8 +11,8 @@ import pyarrow.parquet as pq
 # === GLOBAL VARIABLES: edit these before running ===
 INPUT_PARQUET = "/ocean/projects/bio250072p/jxu23/swiss_under_1000_320M.parquet"  # path to your parquet file
 OUTPUT_DIR = "/ocean/projects/bio250072p/jxu23/pdbs"      # Local directory to save PDB files
-START_ROW = 100                                    # Row to start processing from (0-based, 0 = first row after header)
-MAX_PAIRS = 300000                                 # maximum number of pairs to process from parquet
+START_ROW = 0                                      # Row to start processing from (0-based)
+MAX_PAIRS = 4000000                                # rows to scan; distinct proteins saturate near 400k well before this
 COL1 = "chain_1"                                 # name of first column in parquet
 COL2 = "chain_2"                                 # name of second column in parquet
 
@@ -183,88 +183,75 @@ def download_worker(args):
 
 def collect_ids_from_parquet(parquet_path: str, col1: str, col2: str, max_pairs: int, start_row: int = 0) -> "tuple[set, int, int]":
     """
-    Read the parquet file at parquet_path, expecting columns col1 and col2.
-    Process up to max_pairs rows starting from start_row and collect unique IDs from those two columns.
-    Uses pyarrow to read in chunks to avoid loading entire file into memory.
-    
+    Collect the unique IDs in columns col1 and col2 over parquet rows
+    [start_row, start_row + max_pairs).
+
+    Streams Arrow batches of just the two columns. The source file has
+    67M-row row groups, so reading one whole with every column into pandas
+    (the previous approach) needed tens of GB and was OOM-killed on a
+    shared node.
+
     Returns:
         tuple: (ids: set, pairs_processed: int, last_row: int)
     """
     ids = set()
     pairs_processed = 0
-    last_row = start_row - 1  # Will be updated as we process rows
-    
-    # Open parquet file without loading into memory
+    last_row = start_row - 1
+    batch_size = 65536
+
     parquet_file = pq.ParquetFile(parquet_path)
-    
-    # Get total number of rows
     total_rows = parquet_file.metadata.num_rows
-    
-    # Check if start_row is valid
     if start_row < 0:
         start_row = 0
     if start_row >= total_rows:
         raise ValueError(f"start_row {start_row} is beyond the number of rows ({total_rows}) in the parquet file")
-    
-    # Determine which row groups to read
-    # We'll read row groups that contain our target rows
-    row_groups_to_read = []
-    current_row = 0
-    
-    for i in range(parquet_file.num_row_groups):
-        row_group_metadata = parquet_file.metadata.row_group(i)
-        row_group_size = row_group_metadata.num_rows
-        row_group_end = current_row + row_group_size
-        
-        # Check if this row group overlaps with our target range
-        if row_group_end > start_row:
-            row_groups_to_read.append(i)
-        
-        # Stop if we've covered enough rows
-        if row_group_end >= start_row + max_pairs:
+    end_row = min(start_row + max_pairs, total_rows)
+
+    schema_names = set(parquet_file.schema_arrow.names)
+    if col1 not in schema_names or col2 not in schema_names:
+        raise ValueError(f"Parquet file must contain columns '{col1}' and '{col2}'")
+
+    group_start = 0
+    for group_idx in range(parquet_file.num_row_groups):
+        group_rows = parquet_file.metadata.row_group(group_idx).num_rows
+        group_end = group_start + group_rows
+        if group_end <= start_row:
+            group_start = group_end
+            continue
+        if group_start >= end_row:
             break
-        
-        current_row = row_group_end
-    
-    # Read and process row groups
-    current_global_row = 0
-    for row_group_idx in row_groups_to_read:
-        # Read this row group
-        table = parquet_file.read_row_group(row_group_idx)
-        df_chunk = table.to_pandas()
-        
-        # Verify columns exist
-        if col1 not in df_chunk.columns or col2 not in df_chunk.columns:
-            raise ValueError(f"Parquet file must contain columns '{col1}' and '{col2}'")
-        
-        # Process rows in this chunk
-        for local_idx, (_, row) in enumerate(df_chunk.iterrows()):
-            global_row_idx = current_global_row + local_idx
-            
-            # Skip rows before start_row
-            if global_row_idx < start_row:
+
+        offset = group_start
+        for batch in parquet_file.iter_batches(
+            batch_size=batch_size, row_groups=[group_idx], columns=[col1, col2]
+        ):
+            batch_end = offset + batch.num_rows
+            if batch_end <= start_row:
+                offset = batch_end
                 continue
-            
-            # Check if we've reached max_pairs limit
-            if pairs_processed >= max_pairs:
+            if offset >= end_row:
                 break
-            
-            # Process this row
-            for col in (col1, col2):
-                val = str(row.get(col, "")).strip()
-                if val and val != 'nan':
+
+            # trim the batch to the window, then work on plain Python lists
+            lo = max(start_row - offset, 0)
+            hi = min(end_row - offset, batch.num_rows)
+            values1 = batch.column(col1).slice(lo, hi - lo).to_pylist()
+            values2 = batch.column(col2).slice(lo, hi - lo).to_pylist()
+            for val in values1 + values2:
+                val = str(val).strip() if val is not None else ""
+                if val and val != "nan":
                     ids.add(val)
-            
-            pairs_processed += 1
-            last_row = global_row_idx  # Update last processed row
-            print(f"Processed row {global_row_idx}")
-        
-        current_global_row += len(df_chunk)
-        
-        # Break if we've processed enough pairs
-        if pairs_processed >= max_pairs:
+
+            pairs_processed += hi - lo
+            last_row = offset + hi - 1
+            if pairs_processed % (batch_size * 8) < (hi - lo):
+                print(f"Scanned {pairs_processed:,} rows, {len(ids):,} unique IDs so far", flush=True)
+            offset = batch_end
+
+        group_start = group_end
+        if last_row + 1 >= end_row:
             break
-    
+
     return ids, pairs_processed, last_row
 
 def format_time(seconds):
