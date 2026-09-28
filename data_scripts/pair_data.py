@@ -1,16 +1,18 @@
 """Protein-pair batching, shared by the teacher and the student."""
 
+import os
 from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 from common import embedding_path, log, pdb_path
 from fgw import FGW_LABEL_SCALE, GW_LABEL_SCALE, similarity_from_distortion
 from parse_pdb import parse_pdb
 from patches import K_NEIGHBORS, knn_indices, pad_patch
+from protein_pack import open_pack
 from splits import row_split
 
 USECOLS = [
@@ -61,15 +63,22 @@ def fgw_target(batch, mode="structure", clip=True):
 
 
 class ProteinDataCache:
-    """LRU cache of (coords, embeddings) keyed by UniProt id."""
+    """LRU cache of (coords, embeddings) keyed by UniProt id.
 
-    def __init__(self, pdb_dir, embedding_dir, max_size=32):
+    With pack_dir pointing at a built pack (protein_pack.py), proteins are
+    read from it; anything not in the pack, or no pack at all, falls back to
+    parsing the PDB and loading the embedding file. Both paths return the
+    same arrays.
+    """
+
+    def __init__(self, pdb_dir, embedding_dir, max_size=32, pack_dir=None):
         self.pdb_dir = pdb_dir
         self.embedding_dir = embedding_dir
         self.max_size = max_size
         self.cache = OrderedDict()
         self.hits = 0
         self.misses = 0
+        self.pack = open_pack(pack_dir)
 
     def get(self, uniprot_id):
         if uniprot_id in self.cache:
@@ -78,10 +87,13 @@ class ProteinDataCache:
             return self.cache[uniprot_id]
 
         self.misses += 1
-        coords, _ = parse_pdb(pdb_path(self.pdb_dir, uniprot_id))
-        embeddings = np.load(
-            embedding_path(self.embedding_dir, uniprot_id)
-        ).astype(np.float32)
+        packed = self.pack.get(uniprot_id) if self.pack is not None else None
+        if packed is not None:
+            coords, embeddings = packed
+        else:
+            coords, _ = parse_pdb(pdb_path(self.pdb_dir, uniprot_id))
+            embeddings = np.load(embedding_path(self.embedding_dir, uniprot_id))
+        embeddings = embeddings.astype(np.float32)
 
         if len(coords) != len(embeddings):
             raise ValueError(
@@ -98,6 +110,48 @@ class ProteinDataCache:
     def hit_rate(self):
         total = self.hits + self.misses
         return self.hits / total if total else 0.0
+
+    def lookups(self):
+        """Lookups made in this process; zero when loader workers did the loading."""
+        return self.hits + self.misses
+
+
+def loader_workers(limit=8):
+    """Processes for building batches: this job's CPUs minus one for training."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS
+        cpus = os.cpu_count() or 1
+    return max(0, min(limit, cpus - 1))
+
+
+def seed_worker(worker_id):
+    """Give each loader worker its own stream for the random extra residues.
+
+    Forked workers otherwise inherit identical copies of the dataset's rng.
+    """
+    info = get_worker_info()
+    if info is not None and hasattr(info.dataset, "rng"):
+        info.dataset.rng = np.random.default_rng(info.seed % 2**32)
+
+
+def pair_loader(dataset, batch_size, shuffle, workers=0):
+    """The DataLoader every trainer and evaluator uses.
+
+    workers > 0 builds batches in that many processes while the GPU trains.
+    Pairs that fail to load are then logged by the worker that hit them, and
+    the dataset's own errors list stays empty in this process: count failures
+    as len(dataset) minus the pairs that arrived in batches.
+    """
+    extra = {"worker_init_fn": seed_worker, "prefetch_factor": 4} if workers else {}
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_pairs,
+        num_workers=workers,
+        **extra,
+    )
 
 
 def iter_pair_groups(

@@ -6,7 +6,6 @@ import sys
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -28,9 +27,9 @@ from pair_data import (  # noqa: E402
     ProteinDataCache,
     ProteinPairDataset,
     clip_unit,
-    collate_pairs,
     esm_baseline_similarity,
     iter_group_buffers,
+    pair_loader,
 )
 from splits import split_summary  # noqa: E402
 from train_teacher import (  # noqa: E402
@@ -38,8 +37,10 @@ from train_teacher import (  # noqa: E402
     CLIP_TARGETS,
     CSV_CHUNK_SIZE,
     EMBEDDING_DIR,
+    LOADER_WORKERS,
     FGW_CSV,
     FGW_TARGET,
+    PACK_DIR,
     PDB_DIR,
     forward_batch,
 )
@@ -93,11 +94,8 @@ def evaluate(model, cache):
         max_groups=MAX_GROUPS,
     ):
         buffer_idx += 1
-        loader = DataLoader(
-            ProteinPairDataset(groups, cache),
-            batch_size=EVAL_BATCH_SIZE,
-            shuffle=False,
-            collate_fn=collate_pairs,
+        loader = pair_loader(
+            ProteinPairDataset(groups, cache), EVAL_BATCH_SIZE, shuffle=False, workers=LOADER_WORKERS
         )
         log(f"eval buffer {buffer_idx}: {len(groups)} protein pairs")
 
@@ -156,7 +154,9 @@ def main():
         f"train loss {checkpoint.get('loss', float('nan')):.6f}"
     )
 
-    cache = ProteinDataCache(PDB_DIR, EMBEDDING_DIR, max_size=PROTEIN_CACHE_SIZE)
+    cache = ProteinDataCache(
+        PDB_DIR, EMBEDDING_DIR, max_size=PROTEIN_CACHE_SIZE, pack_dir=PACK_DIR
+    )
     results = evaluate(model, cache)
 
     predictions = results["fgw_pred"]
@@ -189,7 +189,8 @@ def main():
     report_by_bucket(predictions, trained_targets)
     log("")
     log(f"  skipped batches  {results['skipped']}")
-    log(f"  cache hit rate   {cache.hit_rate():.1%}")
+    if cache.lookups():  # loader workers keep their own caches
+        log(f"  cache hit rate   {cache.hit_rate():.1%}")
     log("=" * 60)
     return fgw_metrics
 

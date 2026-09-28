@@ -8,7 +8,6 @@ import sys
 import numpy as np
 import torch
 
-from torch.utils.data import DataLoader
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_SCRIPTS_DIR = os.path.join(REPO_ROOT, "data_scripts")
@@ -26,10 +25,11 @@ from pair_data import (  # noqa: E402
     ProteinDataCache,
     ProteinPairDataset,
     clip_unit,
-    collate_pairs,
     fgw_target,
     iter_group_buffers,
+    loader_workers,
     masked_mse,
+    pair_loader,
 )
 from patches import K_NEIGHBORS  # noqa: E402
 from splits import split_summary  # noqa: E402
@@ -38,6 +38,9 @@ from splits import split_summary  # noqa: E402
 FGW_CSV = "/jet/home/jxu23/OCEANDIR/fgw_scores.csv"
 PDB_DIR = "/jet/home/jxu23/OCEANDIR/pdbs"
 EMBEDDING_DIR = "/jet/home/jxu23/OCEANDIR/embeddings"
+# packed coordinates and embeddings (data_scripts/protein_pack.py); proteins
+# missing from it, or no pack at all, are read from PDB_DIR and EMBEDDING_DIR
+PACK_DIR = "/jet/home/jxu23/OCEANDIR/protein_pack"
 CHECKPOINT_DIR = "/jet/home/jxu23/OCEANDIR/teacher_checkpoints"
 LATEST_CHECKPOINT_NAME = "teacher_latest.pt"
 
@@ -75,6 +78,7 @@ LOSS_BALANCE = "uncertainty"  # or "fixed"
 FGW_TARGET = "structure"  # see pair_data.FGW_TARGETS
 
 PROTEIN_CACHE_SIZE = 512
+LOADER_WORKERS = loader_workers()  # processes building batches; 0 loads in this process
 CHECKPOINT_EVERY_BUFFERS = 10
 VALIDATE_EVERY_BUFFERS = 50  # 0 to validate only at epoch end
 VAL_MAX_GROUPS = 200
@@ -211,22 +215,19 @@ def compute_losses(outputs, batch, balancer):
 
 def train_on_buffer(model, balancer, optimizer, groups, cache, epoch, buffer_idx):
     dataset = ProteinPairDataset(groups, cache)
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        collate_fn=collate_pairs,
-    )
+    loader = pair_loader(dataset, BATCH_SIZE, shuffle=True, workers=LOADER_WORKERS)
 
     model.train()
     totals = {"loss": 0.0, "fgw": 0.0, "tm": 0.0}
     examples = 0
     skipped = 0
+    delivered = 0  # pairs that loaded; the rest of the buffer failed
 
     for batch_idx, batch in enumerate(loader, start=1):
         if batch is None:  # every pair in this batch failed to load
             skipped += 1
             continue
+        delivered += batch["tm"].shape[0]
         try:
             batch = {key: value.to(DEVICE) for key, value in batch.items()}
             outputs = forward_batch(model, batch)
@@ -258,12 +259,15 @@ def train_on_buffer(model, balancer, optimizer, groups, cache, epoch, buffer_idx
             skipped += 1
             log(f"skipped batch in epoch {epoch} buffer {buffer_idx}: {exc}")
 
-    if skipped or dataset.errors:
+    failed_to_load = len(dataset) - delivered
+    if skipped or failed_to_load:
         log(
             f"epoch {epoch} buffer {buffer_idx}: {skipped} batches skipped, "
-            f"{len(dataset.errors)} pairs failed to load"
+            f"{failed_to_load} pairs failed to load"
         )
-        log_failures(dataset.errors, len(dataset))
+        # with loader workers each failure was logged where it happened
+        if dataset.errors:
+            log_failures(dataset.errors, len(dataset))
     return totals["loss"] / max(examples, 1), examples
 
 
@@ -280,11 +284,8 @@ def validate(model, cache, max_groups=VAL_MAX_GROUPS):
         chunk_size=CSV_CHUNK_SIZE,
         max_groups=max_groups,
     ):
-        loader = DataLoader(
-            ProteinPairDataset(groups, cache),
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            collate_fn=collate_pairs,
+        loader = pair_loader(
+            ProteinPairDataset(groups, cache), BATCH_SIZE, shuffle=False, workers=LOADER_WORKERS
         )
         for batch in loader:
             if batch is None:
@@ -375,6 +376,7 @@ def main():
     log(f"Checkpoint dir: {CHECKPOINT_DIR}")
     log(f"Device: {DEVICE}")
     log(f"Protein pairs per batch: {BATCH_SIZE}")
+    log(f"Loader workers: {LOADER_WORKERS}")
     log(f"Epochs: {EPOCHS}")
     log(f"TM head: {USE_TM_HEAD} (w_fgw={W_FGW}, w_tm={W_TM}, balance={LOSS_BALANCE})")
     log(
@@ -412,7 +414,7 @@ def main():
     for epoch in range(start_epoch, EPOCHS + 1):
         log(f"===== epoch {epoch}/{EPOCHS} =====")
         cache = ProteinDataCache(
-            PDB_DIR, EMBEDDING_DIR, max_size=PROTEIN_CACHE_SIZE
+            PDB_DIR, EMBEDDING_DIR, max_size=PROTEIN_CACHE_SIZE, pack_dir=PACK_DIR
         )
         epoch_loss = resume_loss
         epoch_examples = resume_examples
@@ -472,7 +474,8 @@ def main():
         val_metrics = validate(model, cache, max_groups=None)
         log(f"epoch {epoch} finished: train loss={avg_loss:.6f}")
         log_validation(val_metrics, f"epoch {epoch}:")
-        log(f"protein cache hit rate: {cache.hit_rate():.1%}")
+        if cache.lookups():  # loader workers keep their own caches
+            log(f"protein cache hit rate: {cache.hit_rate():.1%}")
         log(f"effective loss weights: {balancer.describe()}")
 
         if val_metrics is not None:

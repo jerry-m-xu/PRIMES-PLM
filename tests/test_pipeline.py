@@ -57,6 +57,13 @@ def module_globals(module, **overrides):
             setattr(module, key, value)
 
 
+@contextlib.contextmanager
+def quiet():
+    """Silence stdout, closing the sink afterwards."""
+    with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
+        yield
+
+
 def random_backbone(num_residues=40, seed=0):
     rng = np.random.default_rng(seed)
     steps = rng.normal(size=(num_residues, 3))
@@ -1230,6 +1237,244 @@ class TestParsePdb(unittest.TestCase):
         self.assertEqual(sequence, "")
         self.assertEqual(tuple(coords.shape), (0, 3))
         self.assertEqual(len(self.parse_pdb.chain_lengths(self.path("empty.pdb"))), 0)
+
+
+def read_bytes(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+class PackFixture(unittest.TestCase):
+    """Fake PDB and embedding directories, with a few proteins that cannot be packed."""
+
+    EMB_DIM = 8
+
+    def setUp(self):
+        try:
+            import Bio  # noqa: F401
+        except ImportError:  # pragma: no cover
+            self.skipTest("biopython not installed")
+        import tempfile
+
+        import protein_pack
+
+        self.protein_pack = protein_pack
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = self.directory.name
+        self.pdb_dir = os.path.join(root, "pdbs")
+        self.emb_dir = os.path.join(root, "embeddings")
+        self.pack_dir = os.path.join(root, "pack")
+        os.makedirs(self.pdb_dir)
+        os.makedirs(self.emb_dir)
+
+        rng = np.random.default_rng(40)
+        self.good = [f"G{k:03d}" for k in range(12)]
+        for k, protein_id in enumerate(self.good):
+            coords = compact_patch(20 + k, seed=k).astype(np.float64) + 10.0 * k
+            self.write_protein(protein_id, coords, rng)
+        # a homo-dimer file: packed as its first chain, like parse_pdb reads it
+        write_multichain_pdb(
+            os.path.join(self.pdb_dir, "DIMER.pdb"),
+            [("A", compact_patch(15, seed=50), "ALA"), ("B", compact_patch(15, seed=51), "ALA")],
+        )
+        np.save(os.path.join(self.emb_dir, "DIMER.npy"), rng.normal(size=(15, self.EMB_DIM)).astype(np.float16))
+        self.good.append("DIMER")
+        # three that must be left out and read from their files instead
+        self.write_protein("MISMATCH", compact_patch(18, seed=60), rng, emb_length=17)
+        self.write_protein("FLOAT32", compact_patch(18, seed=61), rng, dtype=np.float32)
+        write_fake_pdb(os.path.join(self.pdb_dir, "NOEMB.pdb"), compact_patch(18, seed=62))
+        self.bad = ["MISMATCH", "FLOAT32", "NOEMB"]
+
+    def write_protein(self, protein_id, coords, rng, emb_length=None, dtype=np.float16):
+        write_fake_pdb(os.path.join(self.pdb_dir, f"{protein_id}.pdb"), coords)
+        length = len(coords) if emb_length is None else emb_length
+        np.save(
+            os.path.join(self.emb_dir, f"{protein_id}.npy"),
+            rng.normal(size=(length, self.EMB_DIM)).astype(dtype),
+        )
+
+    def pack(self, protein_ids, workers=1):
+        with quiet():
+            return self.protein_pack.pack_proteins(
+                protein_ids, self.pdb_dir, self.emb_dir, self.pack_dir,
+                workers=workers, embedding_dim=self.EMB_DIM, log_every=0,
+            )
+
+    def open(self):
+        return self.protein_pack.ProteinPack(self.pack_dir)
+
+    def reference(self, protein_id):
+        import parse_pdb
+
+        coords, _ = parse_pdb.parse_pdb(os.path.join(self.pdb_dir, f"{protein_id}.pdb"))
+        return coords, np.load(os.path.join(self.emb_dir, f"{protein_id}.npy"))
+
+
+class TestProteinPack(PackFixture):
+    def test_packed_arrays_equal_the_files_exactly(self):
+        packed, skipped, shards = self.pack(self.good + self.bad)
+        self.assertEqual(packed, len(self.good))
+        self.assertEqual(len(shards), 1)
+        pack = self.open()
+        for protein_id in self.good:
+            coords, embeddings = pack.get(protein_id)
+            ref_coords, ref_embeddings = self.reference(protein_id)
+            self.assertEqual(coords.dtype, np.float32)
+            self.assertEqual(embeddings.dtype, np.float16)
+            np.testing.assert_array_equal(coords, ref_coords)
+            np.testing.assert_array_equal(embeddings, ref_embeddings)
+        self.assertEqual(len(pack.get("DIMER")[0]), 15)  # first chain only
+        checked, mismatched = self.protein_pack.verify(self.pack_dir, self.pdb_dir, self.emb_dir, 100)
+        self.assertEqual((checked, mismatched), (len(self.good), []))
+
+    def test_unpackable_proteins_are_left_out_with_a_reason(self):
+        _, skipped, _ = self.pack(self.good + self.bad)
+        pack = self.open()
+        for protein_id in self.bad:
+            self.assertNotIn(protein_id, pack)
+            self.assertIsNone(pack.get(protein_id))
+        self.assertEqual(skipped.get("length mismatch"), 1)
+        self.assertEqual(skipped.get("embedding dtype float32"), 1)
+        self.assertEqual(skipped.get("FileNotFoundError"), 1)
+
+    def test_parallel_workers_write_one_shard_each(self):
+        packed, _, shards = self.pack(self.good, workers=3)
+        self.assertEqual(packed, len(self.good))
+        self.assertEqual(len(shards), 3)
+        pack = self.open()
+        for protein_id in self.good:
+            np.testing.assert_array_equal(pack.get(protein_id)[1], self.reference(protein_id)[1])
+
+    def test_incremental_run_packs_only_new_proteins_into_new_shards(self):
+        self.pack(self.good[:5])
+        first = sorted(os.listdir(self.pack_dir))
+        before = {name: read_bytes(os.path.join(self.pack_dir, name)) for name in first}
+
+        packed, _, shards = self.pack(self.good)
+        self.assertEqual(packed, len(self.good) - 5)
+        self.assertEqual(shards, ["shard_00001"])
+        for name, content in before.items():
+            if name.startswith("shard_"):
+                self.assertEqual(read_bytes(os.path.join(self.pack_dir, name)), content)
+        self.assertEqual(len(self.open()), len(self.good))
+        self.assertEqual(self.pack(self.good)[0], 0)  # nothing left to do
+
+    def test_bytes_past_the_index_are_ignored_and_never_appended_to(self):
+        """A job killed mid-shard leaves data its index never references."""
+        self.pack(self.good[:6])
+        for suffix in (".coords", ".emb"):
+            with open(os.path.join(self.pack_dir, "shard_00000" + suffix), "ab") as handle:
+                handle.write(os.urandom(1000))
+        pack = self.open()
+        for protein_id in self.good[:6]:
+            np.testing.assert_array_equal(pack.get(protein_id)[0], self.reference(protein_id)[0])
+        self.assertEqual(self.pack(self.good)[2], ["shard_00001"])
+
+    def test_pickled_pack_reopens_its_files(self):
+        import pickle
+
+        self.pack(self.good)
+        pack = self.open()
+        pack.get(self.good[0])
+        self.assertTrue(pack._fds)
+        clone = pickle.loads(pickle.dumps(pack))
+        self.assertEqual(clone._fds, {})
+        np.testing.assert_array_equal(clone.get(self.good[1])[1], self.reference(self.good[1])[1])
+
+    def test_rebuild_removes_only_pack_files(self):
+        self.pack(self.good)
+        keep = os.path.join(self.pack_dir, "notes.txt")
+        with open(keep, "w") as handle:
+            handle.write("mine")
+        self.assertGreater(self.protein_pack.remove_pack(self.pack_dir), 0)
+        self.assertEqual(os.listdir(self.pack_dir), ["notes.txt"])
+
+
+@needs_torch
+class TestPackedCache(PackFixture):
+    def test_cache_returns_the_same_arrays_with_and_without_the_pack(self):
+        self.pack(self.good + self.bad)
+        with quiet():
+            packed_cache = pair_data.ProteinDataCache(self.pdb_dir, self.emb_dir, pack_dir=self.pack_dir)
+            file_cache = pair_data.ProteinDataCache(self.pdb_dir, self.emb_dir)
+        self.assertIsNotNone(packed_cache.pack)
+        self.assertIsNone(file_cache.pack)
+        for protein_id in self.good:
+            for packed, direct in zip(packed_cache.get(protein_id), file_cache.get(protein_id)):
+                self.assertEqual(packed.dtype, np.float32)
+                self.assertTrue(packed.flags.writeable)
+                np.testing.assert_array_equal(packed, direct)
+        # not packed: read from the files, failing exactly as before
+        with self.assertRaises(ValueError):
+            packed_cache.get("MISMATCH")
+        np.testing.assert_array_equal(packed_cache.get("FLOAT32")[1], file_cache.get("FLOAT32")[1])
+
+    def test_missing_pack_directory_falls_back_to_files(self):
+        with quiet():
+            cache = pair_data.ProteinDataCache(
+                self.pdb_dir, self.emb_dir, pack_dir=os.path.join(self.pack_dir, "absent")
+            )
+        self.assertIsNone(cache.pack)
+        np.testing.assert_array_equal(cache.get(self.good[0])[1], self.reference(self.good[0])[1].astype(np.float32))
+
+
+@needs_torch
+class TestLoaderWorkers(PackFixture):
+    def groups(self, include_missing=False):
+        import pandas as pd
+
+        rng = np.random.default_rng(3)
+        lengths = {p: len(self.reference(p)[0]) for p in self.good}
+        pairs = [(self.good[k], self.good[k + 1]) for k in range(len(self.good) - 1)]
+        if include_missing:
+            pairs.insert(2, (self.good[0], "NOEMB"))
+            lengths["NOEMB"] = 18
+        groups = []
+        for key, (a, b) in enumerate(pairs):
+            rows = []
+            for r in range(3):
+                rows.append({
+                    "tm_data_row": key, "id1": a, "id2": b,
+                    "residue_idx1": int(rng.integers(0, lengths[a])),
+                    "residue_idx2": int(rng.integers(0, lengths[b])),
+                    "gw_raw": 0.05, "fgw_raw": 0.1, "tm_term": 0.5,
+                    "pair_type": pair_data.PAIR_TYPES[r % 3],
+                    "tm_score_norm1": 0.6, "tm_score_norm2": 0.5,
+                })
+            groups.append(pd.DataFrame(rows))
+        return groups
+
+    def dataset(self, groups):
+        with quiet():
+            cache = pair_data.ProteinDataCache(self.pdb_dir, self.emb_dir, pack_dir=self.pack_dir)
+        return pair_data.ProteinPairDataset(groups, cache, include_sequence=True)
+
+    def batches(self, dataset, workers):
+        with quiet():
+            return [b for b in pair_data.pair_loader(dataset, 2, shuffle=False, workers=workers) if b is not None]
+
+    def test_worker_processes_build_identical_batches(self):
+        self.pack(self.good)
+        groups = self.groups()
+        in_process = self.batches(self.dataset(groups), 0)
+        in_workers = self.batches(self.dataset(groups), 2)
+        self.assertEqual(len(in_process), len(in_workers))
+        for first, second in zip(in_process, in_workers):
+            self.assertEqual(set(first), set(second))
+            for key in first:
+                torch.testing.assert_close(first[key], second[key])
+
+    def test_failures_are_counted_from_delivered_pairs_with_workers(self):
+        self.pack(self.good)
+        dataset = self.dataset(self.groups(include_missing=True))
+        delivered = sum(b["tm"].shape[0] for b in self.batches(dataset, 2))
+        self.assertEqual(len(dataset) - delivered, 1)
+        self.assertEqual(dataset.errors, [])  # recorded in the worker, not here
+
+    def test_loader_workers_leaves_a_cpu_for_training(self):
+        self.assertGreaterEqual(pair_data.loader_workers(), 0)
+        self.assertLessEqual(pair_data.loader_workers(limit=2), 2)
 
 
 if __name__ == "__main__":
