@@ -42,6 +42,81 @@ FGW_TARGETS = ("structure", "composite", "tm_term")
 PAIR_TYPES = ("aligned", "shifted", "random")
 PAIR_TYPE_CODES = {name: code for code, name in enumerate(PAIR_TYPES)}
 
+# Dense teacher-scored pairs (student only). Each protein pair contributes a
+# residue set R1 of protein 1 and R2 of protein 2, and every (r1, r2) in
+# R1 x R2 is scored by the frozen teacher, so no label is needed. The cells
+# fall into these classes, which the loss weights equally:
+#   aligned  on the TM-align path
+#   near     within max_shift residues of the path along either protein:
+#            the hard negatives that sequence context makes look alike
+#   far      everything else
+DENSE_TYPES = ("aligned", "near", "far")
+
+
+class DenseConfig:
+    """How many residues a protein pair contributes to the dense pairs.
+
+    anchors aligned pairs (i, j) put i in R1 and j in R2;
+    shifts_per_anchor residues j +/- s, s in [1, max_shift], join R2 per anchor;
+    random residues of each protein join R1 and R2.
+    """
+
+    def __init__(self, anchors=16, shifts_per_anchor=2, max_shift=32, random=8):
+        self.anchors = anchors
+        self.shifts_per_anchor = shifts_per_anchor
+        self.max_shift = max_shift
+        self.random = random
+
+
+def sample_dense_residues(aligned1, aligned2, length1, length2, config, rng):
+    """Residue sets R1, R2 and the class of every R1 x R2 cell.
+
+    aligned1, aligned2: residue indices of the aligned pairs to draw anchors
+    from (the full alignment when available, else the labelled positives).
+    Returns (r1, r2, types), r1 and r2 sorted and unique, types an int8
+    [len(r1), len(r2)] matrix of DENSE_TYPES codes.
+    """
+    aligned1 = np.asarray(aligned1, dtype=np.int64)
+    aligned2 = np.asarray(aligned2, dtype=np.int64)
+
+    pick = rng.choice(len(aligned1), size=min(config.anchors, len(aligned1)), replace=False)
+    anchors1, anchors2 = aligned1[pick], aligned2[pick]
+
+    # j +/- s, falling back to the other direction near a chain end, as
+    # fgw_data.shifted_pair() does
+    count = len(anchors2) * config.shifts_per_anchor
+    centres = np.repeat(anchors2, config.shifts_per_anchor)
+    steps = rng.integers(1, config.max_shift + 1, size=count) * rng.choice((-1, 1), size=count)
+    shifted = centres + steps
+    outside = (shifted < 0) | (shifted >= length2)
+    shifted[outside] = centres[outside] - steps[outside]
+    shifted = shifted[(shifted >= 0) & (shifted < length2)]
+
+    random1 = rng.choice(length1, size=min(config.random, length1), replace=False)
+    random2 = rng.choice(length2, size=min(config.random, length2), replace=False)
+
+    r1 = np.unique(np.concatenate([anchors1, random1])).astype(np.int64)
+    r2 = np.unique(np.concatenate([anchors2, shifted, random2])).astype(np.int64)
+
+    # each residue's partner on the path, -1 if it has none
+    partner_of_1 = np.full(length1, -1, dtype=np.int64)
+    partner_of_1[aligned1] = aligned2
+    partner_of_2 = np.full(length2, -1, dtype=np.int64)
+    partner_of_2[aligned2] = aligned1
+    p1 = partner_of_1[r1][:, None]  # partner in protein 2 of each R1 residue
+    p2 = partner_of_2[r2][None, :]  # partner in protein 1 of each R2 residue
+    offset2 = np.abs(r2[None, :] - p1)
+    offset1 = np.abs(r1[:, None] - p2)
+
+    on_path = (p1 >= 0) & (offset2 == 0)
+    near = ((p1 >= 0) & (offset2 <= config.max_shift)) | (
+        (p2 >= 0) & (offset1 <= config.max_shift)
+    )
+    types = np.full((len(r1), len(r2)), DENSE_TYPES.index("far"), dtype=np.int8)
+    types[near] = DENSE_TYPES.index("near")
+    types[on_path] = DENSE_TYPES.index("aligned")
+    return r1, r2, types
+
 
 def select_fgw_target(batch, mode="structure"):
     if mode == "structure":
@@ -219,6 +294,8 @@ class ProteinPairDataset(Dataset):
         include_sequence=False,
         max_seq_length=1000,
         extra_distill_residues=0,
+        dense=None,
+        aligned_columns=None,
         skip_errors=True,
     ):
         self.groups = groups
@@ -226,6 +303,8 @@ class ProteinPairDataset(Dataset):
         self.include_sequence = include_sequence
         self.max_seq_length = max_seq_length
         self.extra_distill_residues = extra_distill_residues
+        self.dense = dense  # DenseConfig, or None for no dense pairs
+        self.aligned_columns = aligned_columns  # aligned_columns.AlignedColumns or None
         self.rng = np.random.default_rng()
         self.skip_errors = skip_errors
         self.errors = []
@@ -323,7 +402,36 @@ class ProteinPairDataset(Dataset):
                 item[f"extra_patch_features{side}"] = pf
                 item[f"extra_patch_mask{side}"] = pm
 
+        if self.dense is not None:
+            aligned1, aligned2 = self.dense_anchors(group, residue_idx1, residue_idx2)
+            r1, r2, types = sample_dense_residues(
+                aligned1, aligned2, len(coords1), len(coords2), self.dense, self.rng
+            )
+            item["dense_type"] = types
+            for side, residues, coords, features in (
+                ("1", r1, coords1, features1),
+                ("2", r2, coords2, features2),
+            ):
+                pc, pf, pm = self.build_patches(coords, features, residues)
+                item[f"dense_residue_idx{side}"] = residues
+                item[f"dense_patch_coords{side}"] = pc
+                item[f"dense_patch_features{side}"] = pf
+                item[f"dense_patch_mask{side}"] = pm
+
         return item
+
+    def dense_anchors(self, group, residue_idx1, residue_idx2):
+        """Aligned pairs to draw dense anchors from.
+
+        Every TM-align column when the aligned-columns store has this pair,
+        else the labelled positives (every 32nd column).
+        """
+        if self.aligned_columns is not None:
+            aligned = self.aligned_columns.get(int(group["tm_data_row"].iloc[0]))
+            if aligned is not None and len(aligned[0]) > 0:
+                return aligned
+        positives = group["pair_type"].to_numpy() == "aligned"
+        return residue_idx1[positives], residue_idx2[positives]
 
 
 def collate_pairs(items):
@@ -381,6 +489,27 @@ def collate_pairs(items):
                 batch_size, max_extra, K_NEIGHBORS, dtype=torch.bool
             )
 
+    include_dense = "dense_type" in items[0]
+    if include_dense:
+        max_dense = {
+            side: max(len(item[f"dense_residue_idx{side}"]) for item in items)
+            for side in ("1", "2")
+        }
+        out["dense_type"] = torch.full(
+            (batch_size, max_dense["1"], max_dense["2"]), -1, dtype=torch.long
+        )
+        for side in ("1", "2"):
+            count = max_dense[side]
+            out[f"dense_mask{side}"] = torch.zeros(batch_size, count, dtype=torch.bool)
+            out[f"dense_residue_idx{side}"] = torch.zeros(batch_size, count, dtype=torch.long)
+            out[f"dense_patch_features{side}"] = torch.zeros(
+                batch_size, count, K_NEIGHBORS, feature_dim
+            )
+            out[f"dense_patch_coords{side}"] = torch.zeros(batch_size, count, K_NEIGHBORS, 3)
+            out[f"dense_patch_mask{side}"] = torch.zeros(
+                batch_size, count, K_NEIGHBORS, dtype=torch.bool
+            )
+
     if include_sequence:
         max_len = max(
             max(len(item["features1"]), len(item["features2"])) for item in items
@@ -423,6 +552,18 @@ def collate_pairs(items):
                         item[f"{key}{side}"]
                     )
 
+            if include_dense:
+                count = len(item[f"dense_residue_idx{side}"])
+                out[f"dense_mask{side}"][i, :count] = True
+                out[f"dense_residue_idx{side}"][i, :count] = torch.from_numpy(
+                    item[f"dense_residue_idx{side}"]
+                )
+                for key in ("dense_patch_features", "dense_patch_coords",
+                            "dense_patch_mask"):
+                    out[f"{key}{side}"][i, :count] = torch.from_numpy(
+                        item[f"{key}{side}"]
+                    )
+
             if include_sequence:
                 length = len(item[f"features{side}"])
                 out[f"features{side}"][i, :length] = torch.from_numpy(
@@ -432,6 +573,10 @@ def collate_pairs(items):
                 out[f"residue_idx{side}"][i, :num_residues] = torch.from_numpy(
                     item[f"residue_idx{side}"]
                 )
+
+        if include_dense:
+            m1, m2 = item["dense_type"].shape
+            out["dense_type"][i, :m1, :m2] = torch.from_numpy(item["dense_type"].astype(np.int64))
 
     return out
 

@@ -195,6 +195,8 @@ class SequenceStudent(nn.Module):
         pair_mask=None,
         extra_residue_idx1=None,
         extra_residue_idx2=None,
+        dense_residue_idx1=None,
+        dense_residue_idx2=None,
     ):
         """One protein pair per batch row, with K sampled residue pairs each.
 
@@ -202,7 +204,8 @@ class SequenceStudent(nn.Module):
         embeddings; "local_similarity" is its calibrated version, trained
         against the label. "similarity_matrix" is the full [B, L1, L2]
         cosine matrix, which the global head summarises and which an
-        alignment decoder can consume.
+        alignment decoder can consume. "dense_similarity" is the calibrated
+        similarity of every pair in the dense residue sets, [B, M1, M2].
         """
         z1 = self.forward(features1, seq_mask1)
         z2 = self.forward(features2, seq_mask2)
@@ -234,6 +237,15 @@ class SequenceStudent(nn.Module):
             outputs["extra_z1"] = self.gather_residues(z1, extra_residue_idx1)
         if extra_residue_idx2 is not None:
             outputs["extra_z2"] = self.gather_residues(z2, extra_residue_idx2)
+
+        if dense_residue_idx1 is not None and dense_residue_idx2 is not None:
+            dense_z1 = self.gather_residues(z1, dense_residue_idx1)
+            dense_z2 = self.gather_residues(z2, dense_residue_idx2)
+            outputs["dense_z1"] = dense_z1
+            outputs["dense_z2"] = dense_z2
+            outputs["dense_similarity"] = self.calibration(
+                torch.bmm(dense_z1, dense_z2.transpose(1, 2))
+            )
 
         if self.use_tm_head and self.global_head is not None:
             stats = similarity_statistics(similarity_matrix, seq_mask1.bool(), seq_mask2.bool())

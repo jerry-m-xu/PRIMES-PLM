@@ -19,12 +19,16 @@ for _path in (
         sys.path.insert(0, _path)
 
 from egnn_model import SiameseEGNNTeacher  # noqa: E402
+from aligned_columns import open_aligned_columns  # noqa: E402
 from common import log  # noqa: E402
 from common import log_failures  # noqa: E402
 from fgw import FGW_LABEL_SCALE, GW_LABEL_SCALE  # noqa: E402
 from losses import LossBalancer  # noqa: E402
 from metrics import log_validation, summarise  # noqa: E402
 from pair_data import (  # noqa: E402
+    DENSE_TYPES,
+    PAIR_TYPES,
+    DenseConfig,
     ProteinDataCache,
     ProteinPairDataset,
     clip_unit,
@@ -44,8 +48,13 @@ EMBEDDING_DIR = "/jet/home/jxu23/OCEANDIR/embeddings"
 # packed coordinates and embeddings (data_scripts/protein_pack.py); proteins
 # missing from it, or no pack at all, are read from PDB_DIR and EMBEDDING_DIR
 PACK_DIR = "/jet/home/jxu23/OCEANDIR/protein_pack"
+# every TM-align column per protein pair (data_scripts/aligned_columns.py); without
+# it the dense anchors fall back to the labelled positives
+ALIGNED_COLUMNS_DIR = "/jet/home/jxu23/OCEANDIR/aligned_columns"
 TEACHER_CHECKPOINT = "/jet/home/jxu23/OCEANDIR/teacher_checkpoints/teacher_best.pt"
-CHECKPOINT_DIR = "/jet/home/jxu23/OCEANDIR/student_checkpoints"
+# student_checkpoints holds the first run (embedding distillation, no dense
+# pairs), kept as the baseline
+CHECKPOINT_DIR = "/jet/home/jxu23/OCEANDIR/student_checkpoints_dense"
 LATEST_CHECKPOINT_NAME = "student_latest.pt"
 
 CSV_CHUNK_SIZE = 5000
@@ -58,7 +67,7 @@ SEED = 7
 BATCH_SIZE = 4  # protein pairs per step
 EPOCHS = 10
 LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-5
+WEIGHT_DECAY = 0.02  # matrices only; biases, norms, calibration and balancer are exempt
 GRAD_CLIP = 1.0
 LOG_EVERY_BATCHES = 20
 
@@ -68,17 +77,30 @@ HIDDEN_DIM = 256
 NUM_LAYERS = 4
 NUM_HEADS = 8
 FF_DIM = 1024
-DROPOUT = 0.1
+DROPOUT = 0.2
 
 CLIP_TARGETS = True
 FGW_TARGET = "structure"  # see pair_data.FGW_TARGETS; "composite" rewards echoing ESM
 
-EXTRA_DISTILL_RESIDUES = 16
+# random unlabelled residues for embedding distillation; the dense residues
+# below already serve that purpose, so this is off by default
+EXTRA_DISTILL_RESIDUES = 0
+
+# Dense teacher-scored pairs: per protein pair, residue sets R1 and R2 built
+# from aligned anchors, shifts of them along protein 2, and random residues;
+# the student's calibrated similarity is fitted to the frozen teacher's on
+# every cell of R1 x R2, the aligned, near-path and far cells weighted equally
+# (pair_data.sample_dense_residues). The labels give the student about six
+# negatives per protein pair; this gives it hundreds, most of them the
+# near-path pairs it otherwise scores too high.
+DENSE = DenseConfig(anchors=16, shifts_per_anchor=2, max_shift=32, random=8)
 
 # prior weights; under LOSS_BALANCE = "uncertainty" each term is also rescaled
 # by a learned precision, so the ~0.01-scale label MSEs are not drowned by the
 # ~0.3-scale distillation cosine (losses.py)
-W_DISTILL = 1.0  # per-residue embedding distillation
+W_DISTILL = 0.25  # per-residue embedding distillation; matching the teacher's
+                  # vectors is not required, only its similarities
+W_DENSE = 1.0  # dense teacher-scored similarity
 W_GLOBAL = 0.5  # global embedding distillation (the teacher's fold-level view)
 W_FGW = 1.0
 W_TM = 0.2  # both TM normalisations, from the student's own global head
@@ -101,6 +123,8 @@ CONFIG_FINGERPRINT = {
     "fgw_label_scale": FGW_LABEL_SCALE,
     "use_tm_head": W_TM > 0,
     "loss_balance": LOSS_BALANCE,
+    "w_dense": W_DENSE,
+    "dense": vars(DENSE),
     "hidden_dim": HIDDEN_DIM,
     "num_layers": NUM_LAYERS,
     "num_heads": NUM_HEADS,
@@ -174,20 +198,47 @@ def load_resume_state(model, balancer, optimizer):
     )
 
 
-def make_dataset(groups, cache, extra_distill_residues=0):
+def make_dataset(groups, cache, extra_distill_residues=0, dense=None, aligned_columns=None):
     return ProteinPairDataset(
         groups,
         cache,
         include_sequence=True,
         max_seq_length=MAX_SEQ_LENGTH,
         extra_distill_residues=extra_distill_residues,
+        dense=dense,
+        aligned_columns=aligned_columns,
     )
 
 
 def build_balancer():
     return LossBalancer(
-        {"distill": W_DISTILL, "global": W_GLOBAL, "fgw": W_FGW, "tm": W_TM},
+        {
+            "distill": W_DISTILL,
+            "global": W_GLOBAL,
+            "fgw": W_FGW,
+            "dense": W_DENSE,
+            "tm": W_TM,
+        },
         mode=LOSS_BALANCE,
+    )
+
+
+def build_optimizer(student, balancer):
+    """AdamW with weight decay on weight matrices only.
+
+    Decaying the calibration's scale and offset, the norms' gains, or the
+    balancer's log-variances would pull them toward zero for no benefit.
+    """
+    decay, no_decay = [], []
+    for parameter in student.parameters():
+        (decay if parameter.ndim >= 2 else no_decay).append(parameter)
+    no_decay.extend(balancer.parameters())
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": WEIGHT_DECAY},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=LEARNING_RATE,
     )
 
 
@@ -218,6 +269,8 @@ def student_forward(student, batch):
         pair_mask=batch["pair_mask"],
         extra_residue_idx1=batch.get("extra_residue_idx1"),
         extra_residue_idx2=batch.get("extra_residue_idx2"),
+        dense_residue_idx1=batch.get("dense_residue_idx1"),
+        dense_residue_idx2=batch.get("dense_residue_idx2"),
     )
 
 
@@ -225,6 +278,33 @@ def teacher_global(teacher, teacher_z, pair_mask):
     """The teacher's pooled fold-level embedding, over the sampled residues."""
     pooled = teacher._masked_mean(teacher_z, pair_mask)
     return torch.nn.functional.normalize(pooled, dim=-1)
+
+
+@torch.no_grad()
+def teacher_dense_similarity(teacher, batch):
+    """The frozen teacher's predicted label on every dense pair, [B, M1, M2].
+
+    Also returns its dense residue embeddings, for distillation.
+    """
+    dense_z1 = teacher_embeddings(teacher, batch, "1", prefix="dense_")
+    dense_z2 = teacher_embeddings(teacher, batch, "2", prefix="dense_")
+    similarity = teacher.calibration(torch.bmm(dense_z1, dense_z2.transpose(1, 2)))
+    # padded cells are masked out of the loss; keep them finite so they
+    # cannot leak NaN into the gradient
+    return torch.nan_to_num(similarity.clamp(0.0, 1.0)), dense_z1, dense_z2
+
+
+def dense_similarity_loss(student_similarity, teacher_similarity, dense_type):
+    """MSE to the teacher's similarity, each DENSE_TYPES class weighted equally."""
+    error = (student_similarity - teacher_similarity) ** 2
+    per_class = [
+        error[dense_type == code].mean()
+        for code in range(len(DENSE_TYPES))
+        if bool((dense_type == code).any())
+    ]
+    if not per_class:
+        return torch.zeros((), device=error.device)
+    return torch.stack(per_class).mean()
 
 
 def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher=None):
@@ -242,7 +322,18 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher
             cosine = (student_out[f"global_sampled_z{side}"] * reference).sum(dim=-1)
             global_distill = global_distill + 0.5 * (1.0 - cosine).mean()
 
+    dense = None
+    dense_teacher_z = {}
+    if teacher is not None and "dense_similarity" in student_out:
+        teacher_similarity, dense_teacher_z["1"], dense_teacher_z["2"] = (
+            teacher_dense_similarity(teacher, batch)
+        )
+        dense = dense_similarity_loss(
+            student_out["dense_similarity"], teacher_similarity, batch["dense_type"]
+        )
+
     # unlabelled residues: distillation only, no FGW/TM target exists for them
+    unlabelled = []
     if teacher is not None and "extra_z1" in student_out:
         extra_distill = torch.zeros((), device=distill.device)
         for side in ("1", "2"):
@@ -250,7 +341,18 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher
             extra_distill = extra_distill + 0.5 * distillation_loss(
                 student_out[f"extra_z{side}"], reference, batch[f"extra_mask{side}"]
             )
-        distill = 0.5 * (distill + extra_distill)
+        unlabelled.append(extra_distill)
+    if dense_teacher_z:
+        unlabelled.append(
+            sum(
+                0.5 * distillation_loss(
+                    student_out[f"dense_z{side}"], dense_teacher_z[side], batch[f"dense_mask{side}"]
+                )
+                for side in ("1", "2")
+            )
+        )
+    if unlabelled:
+        distill = 0.5 * (distill + sum(unlabelled) / len(unlabelled))
 
     losses = {
         "distill": distill,
@@ -261,6 +363,8 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher
             pair_mask,
         ),
     }
+    if dense is not None:
+        losses["dense"] = dense
 
     if "tm_score_pred" in student_out:
         tm1 = torch.mean(
@@ -275,12 +379,20 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher
     return total, {name: float(value.detach()) for name, value in losses.items()}
 
 
-def train_on_buffer(student, teacher, balancer, optimizer, groups, cache, epoch, buffer_idx):
-    dataset = make_dataset(groups, cache, EXTRA_DISTILL_RESIDUES)
+def train_on_buffer(
+    student, teacher, balancer, optimizer, groups, cache, epoch, buffer_idx, aligned_columns=None
+):
+    dataset = make_dataset(
+        groups,
+        cache,
+        EXTRA_DISTILL_RESIDUES,
+        dense=DENSE if W_DENSE > 0 else None,
+        aligned_columns=aligned_columns,
+    )
     loader = pair_loader(dataset, BATCH_SIZE, shuffle=True, workers=LOADER_WORKERS)
 
     student.train()
-    totals = {"loss": 0.0, "distill": 0.0, "global": 0.0, "fgw": 0.0, "tm": 0.0}
+    totals = {"loss": 0.0, "distill": 0.0, "global": 0.0, "fgw": 0.0, "dense": 0.0, "tm": 0.0}
     examples = 0
     skipped = 0
     delivered = 0  # pairs that loaded; the rest of the buffer failed
@@ -321,6 +433,7 @@ def train_on_buffer(student, teacher, balancer, optimizer, groups, cache, epoch,
                     f"(distill={totals['distill'] / max(examples, 1):.4f} "
                     f"global={totals['global'] / max(examples, 1):.4f} "
                     f"fgw={totals['fgw'] / max(examples, 1):.4f} "
+                    f"dense={totals['dense'] / max(examples, 1):.4f} "
                     f"tm={totals['tm'] / max(examples, 1):.4f}) "
                     f"[{balancer.describe()}]"
                 )
@@ -343,7 +456,7 @@ def train_on_buffer(student, teacher, balancer, optimizer, groups, cache, epoch,
 @torch.no_grad()
 def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
     student.eval()
-    fgw_pred, fgw_true = [], []
+    fgw_pred, fgw_true, fgw_type = [], [], []
     tm_pred, tm_true, tm2_pred, tm2_true = [], [], [], []
     agreement = []
 
@@ -367,6 +480,7 @@ def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
 
                 fgw_pred.append(out["local_similarity"][mask].cpu().numpy())
                 fgw_true.append(fgw_target(batch, FGW_TARGET, CLIP_TARGETS)[mask].cpu().numpy())
+                fgw_type.append(batch["pair_type"][mask].cpu().numpy())
                 if "tm_score_pred" in out:
                     tm_pred.append(out["tm_score_pred"].cpu().numpy())
                     tm_true.append(clip_unit(batch["tm"], CLIP_TARGETS).cpu().numpy())
@@ -385,6 +499,14 @@ def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
         return None
 
     metrics = {"fgw": summarise(fgw_pred, fgw_true)}
+    # the student's weak point was ranking the negatives, so watch each type
+    types = np.concatenate(fgw_type)
+    predictions, targets = np.concatenate(fgw_pred), np.concatenate(fgw_true)
+    metrics["fgw_by_type"] = {
+        name: summarise([predictions[types == code]], [targets[types == code]])
+        for code, name in enumerate(PAIR_TYPES)
+        if (types == code).sum() > 1
+    }
     if tm_pred:
         metrics["tm"] = summarise(tm_pred, tm_true)
         metrics["tm2"] = summarise(tm2_pred, tm2_true)
@@ -486,7 +608,11 @@ def save_checkpoint(
                 "gw_label_scale": GW_LABEL_SCALE,
                 "fgw_label_scale": FGW_LABEL_SCALE,
                 "loss_balance": LOSS_BALANCE,
+                "dropout": DROPOUT,
+                "weight_decay": WEIGHT_DECAY,
                 "extra_distill_residues": EXTRA_DISTILL_RESIDUES,
+                "w_dense": W_DENSE,
+                "dense": vars(DENSE),
                 "teacher_checkpoint": TEACHER_CHECKPOINT,
             },
         },
@@ -506,8 +632,10 @@ def main():
     log(f"Loader workers: {LOADER_WORKERS}")
     log(
         f"Loss weights: distill={W_DISTILL} global={W_GLOBAL} "
-        f"fgw={W_FGW} tm={W_TM} (balance={LOSS_BALANCE})"
+        f"fgw={W_FGW} dense={W_DENSE} tm={W_TM} (balance={LOSS_BALANCE})"
     )
+    log(f"Regularisation: weight decay={WEIGHT_DECAY} dropout={DROPOUT}")
+    log(f"Dense pairs: {vars(DENSE)}")
     log(
         f"FGW target: {FGW_TARGET} (label scales: structure={GW_LABEL_SCALE}, "
         f"composite={FGW_LABEL_SCALE})"
@@ -524,6 +652,17 @@ def main():
 
     teacher, teacher_config = load_teacher()
 
+    aligned_columns = open_aligned_columns(ALIGNED_COLUMNS_DIR)
+    if W_DENSE > 0:
+        if aligned_columns is None:
+            log(
+                f"WARNING: no aligned-columns store at {ALIGNED_COLUMNS_DIR}; dense "
+                f"anchors come from the labelled positives only. Build it with "
+                f"python data_scripts/aligned_columns.py"
+            )
+        else:
+            log(f"aligned columns: {len(aligned_columns)} protein pairs from {ALIGNED_COLUMNS_DIR}")
+
     student = SequenceStudent(
         input_dim=INPUT_DIM,
         hidden_dim=HIDDEN_DIM,
@@ -538,11 +677,7 @@ def main():
     balancer = build_balancer().to(DEVICE)
     log("student loaded onto device")
 
-    optimizer = torch.optim.AdamW(
-        list(student.parameters()) + list(balancer.parameters()),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
+    optimizer = build_optimizer(student, balancer)
 
     (
         start_epoch,
@@ -575,7 +710,15 @@ def main():
             buffer_idx += 1
             log(f"epoch {epoch}: buffer {buffer_idx} ({len(groups)} protein pairs)")
             buffer_loss, n = train_on_buffer(
-                student, teacher, balancer, optimizer, groups, cache, epoch, buffer_idx
+                student,
+                teacher,
+                balancer,
+                optimizer,
+                groups,
+                cache,
+                epoch,
+                buffer_idx,
+                aligned_columns=aligned_columns,
             )
             epoch_loss += buffer_loss * n
             epoch_examples += n

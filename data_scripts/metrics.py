@@ -69,6 +69,12 @@ def log_validation(metrics, prefix):
             f"mse={values['mse']:.6f} r2={values['r2']:.4f} "
             f"r={values['pearson']:.4f}"
         )
+    for name, values in metrics.get("fgw_by_type", {}).items():
+        log(
+            f"{prefix} val FGW {name:<7}: n={values['n']} "
+            f"mse={values['mse']:.6f} r2={values['r2']:.4f} "
+            f"r={values['pearson']:.4f}"
+        )
     if "agreement" in metrics:
         log(f"{prefix} teacher agreement (cosine): {metrics['agreement']:.4f}")
 
