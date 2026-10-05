@@ -6,11 +6,20 @@
 #SBATCH --time=08:00:00
 #SBATCH --output=embed_%j.out
 #
-# ESM-2 per-residue embeddings for every protein in a parquet row window.
+# ESM-2 per-residue embeddings for every protein in a parquet row window,
+# or for a list of proteins.
 #
 #   sbatch data_scripts/embed.sh                                  # rows [0, 4000000): the whole protein pool
-#   START_ROW=181288 END_ROW=1000000 sbatch data_scripts/embed.sh
+#   sbatch --export=ALL,START_ROW=181288,END_ROW=1000000 data_scripts/embed.sh
+#   sbatch --export=ALL,ESM_MODEL=650M,PART=0/4 data_scripts/embed.sh   # one of 4 parallel jobs
 #   bash data_scripts/embed.sh                                    # inside an interactive GPU session
+#
+# ESM_MODEL (35M, 150M, 650M, 3B; default 35M) picks the checkpoint. Models
+# other than 35M write to embeddings_<model>/ and never touch embeddings/,
+# and embed every protein in fgw_scores.csv (PROTEINS_IN to choose another
+# CSV, PROTEIN_LIST for a text file of ids) rather than a parquet window.
+# PART=K/N takes every N-th protein from the K-th, so N jobs split the work;
+# submit K=0..N-1. Their sequences come from tm_scores.csv, not the PDBs.
 #
 # The stage skips any protein that already has an embedding, so re-running a
 # window is safe, and a job cut off by the wall clock is resumed by
@@ -43,6 +52,18 @@ if [ ! -f "$REPO_DIR/data_scripts/common.py" ]; then
 fi
 START_ROW="${START_ROW:-0}"
 END_ROW="${END_ROW:-4000000}"   # distinct proteins saturate well before this
+ESM_MODEL="${ESM_MODEL:-35M}"
+PROTEIN_LIST="${PROTEIN_LIST:-}"
+PROTEINS_IN="${PROTEINS_IN:-}"
+PART="${PART:-}"
+if [ "$ESM_MODEL" != "35M" ] && [ -z "$PROTEIN_LIST" ] && [ -z "$PROTEINS_IN" ]; then
+    PROTEINS_IN="$DATA_DIR/fgw_scores.csv"
+fi
+if [ "$ESM_MODEL" = "35M" ]; then
+    EMB_DIR="$DATA_DIR/embeddings"
+else
+    EMB_DIR="$DATA_DIR/embeddings_$ESM_MODEL"
+fi
 
 # A batch job does not inherit an interactively-activated venv. Source the
 # project setup from the repo or the home directory, or point VENV at an
@@ -65,19 +86,32 @@ fi
 echo "python: $(command -v python)"
 
 echo "=================================================================="
-echo "  embedding rows [$START_ROW, $END_ROW)"
+if [ -n "$PROTEIN_LIST" ] || [ -n "$PROTEINS_IN" ]; then
+    if [ -n "$PROTEIN_LIST" ]; then
+        ARGS=(--protein-list "$PROTEIN_LIST")
+    else
+        ARGS=(--proteins-in "$PROTEINS_IN")
+    fi
+    echo "  embedding the proteins of ${PROTEIN_LIST:-$PROTEINS_IN}${PART:+ (part $PART)} with ESM-2 $ESM_MODEL"
+    ARGS+=(--model "$ESM_MODEL" --sequences-from "$DATA_DIR/tm_scores.csv")
+    if [ -n "$PART" ]; then
+        ARGS+=(--part "$PART")
+    fi
+else
+    echo "  embedding rows [$START_ROW, $END_ROW) with ESM-2 $ESM_MODEL"
+    ARGS=(--model "$ESM_MODEL" --start-row "$START_ROW" --end-row "$END_ROW")
+fi
 echo "=================================================================="
 echo "  repo        $REPO_DIR"
-echo "  embeddings  $DATA_DIR/embeddings  ($(ls "$DATA_DIR/embeddings" 2>/dev/null | wc -l) files before)"
+echo "  embeddings  $EMB_DIR  ($(ls "$EMB_DIR" 2>/dev/null | wc -l) files before)"
 echo "  gpu         ${CUDA_VISIBLE_DEVICES:-none visible}"
 echo "  started     $(date)"
 echo ""
 
-python "$REPO_DIR/data_scripts/precompute_esm.py" \
-    --start-row "$START_ROW" --end-row "$END_ROW"
+python "$REPO_DIR/data_scripts/precompute_esm.py" "${ARGS[@]}"
 
 echo ""
-echo "  embeddings  $(ls "$DATA_DIR/embeddings" | wc -l) files after"
+echo "  embeddings  $(ls "$EMB_DIR" | wc -l) files after"
 echo "  finished    $(date)"
 echo ""
 echo "Next: python data_scripts/audit_upstream.py"

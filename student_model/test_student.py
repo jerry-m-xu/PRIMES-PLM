@@ -17,7 +17,7 @@ for _path in (
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from common import log  # noqa: E402
+from common import BASE_ESM, log  # noqa: E402
 from metrics import report, report_by_group, report_esm_baseline  # noqa: E402
 from pair_data import (  # noqa: E402
     PAIR_TYPES,
@@ -41,13 +41,17 @@ from train_student import (  # noqa: E402
     PDB_DIR,
     load_teacher,
     make_dataset,
+    student_feature_store,
     student_forward,
     teacher_embeddings,
 )
 
 # global config
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "student_best.pt")
-SPLIT = "test"
+# CHECKPOINT_DIR follows RUN_NAME (train_student.py); CHECKPOINT and SPLIT
+# override from the environment, e.g. the first run on the validation set:
+#   CHECKPOINT=$D/student_checkpoints/student_best.pt SPLIT=val
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT", os.path.join(CHECKPOINT_DIR, "student_best.pt"))
+SPLIT = os.environ.get("SPLIT", "test")
 EVAL_BATCH_SIZE = 8
 GROUPS_PER_BUFFER = 256
 PROTEIN_CACHE_SIZE = 512
@@ -80,7 +84,7 @@ def load_student(checkpoint_path):
 
 
 @torch.no_grad()
-def evaluate(student, teacher, cache):
+def evaluate(student, teacher, cache, student_features=None):
     fgw_pred, tm_pred, tm_true, tm2_pred, tm2_true, agreement = [], [], [], [], [], []
     pair_types = []
     targets = {"structure": [], "composite": [], "tm_term": []}
@@ -97,7 +101,10 @@ def evaluate(student, teacher, cache):
     ):
         buffer_idx += 1
         loader = pair_loader(
-            make_dataset(groups, cache), EVAL_BATCH_SIZE, shuffle=False, workers=LOADER_WORKERS
+            make_dataset(groups, cache, student_features=student_features),
+            EVAL_BATCH_SIZE,
+            shuffle=False,
+            workers=LOADER_WORKERS,
         )
         log(f"eval buffer {buffer_idx}: {len(groups)} protein pairs")
 
@@ -175,7 +182,10 @@ def main():
     cache = ProteinDataCache(
         PDB_DIR, EMBEDDING_DIR, max_size=PROTEIN_CACHE_SIZE, pack_dir=PACK_DIR
     )
-    results = evaluate(student, teacher, cache)
+    # the student reads the embeddings it was trained on; the teacher, 35M
+    student_esm = checkpoint["config"].get("student_esm", BASE_ESM)
+    log(f"student input: ESM-2 {student_esm}")
+    results = evaluate(student, teacher, cache, student_feature_store(student_esm))
 
     predictions = results["fgw_pred"]
     targets = results["targets"]

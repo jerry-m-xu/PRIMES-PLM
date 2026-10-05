@@ -20,7 +20,7 @@ for _path in (
 
 from egnn_model import SiameseEGNNTeacher  # noqa: E402
 from aligned_columns import open_aligned_columns  # noqa: E402
-from common import log  # noqa: E402
+from common import BASE_ESM, ESM_MODELS, esm_dirs, log  # noqa: E402
 from common import log_failures  # noqa: E402
 from fgw import FGW_LABEL_SCALE, GW_LABEL_SCALE  # noqa: E402
 from losses import LossBalancer  # noqa: E402
@@ -29,6 +29,7 @@ from pair_data import (  # noqa: E402
     DENSE_TYPES,
     PAIR_TYPES,
     DenseConfig,
+    EmbeddingStore,
     ProteinDataCache,
     ProteinPairDataset,
     clip_unit,
@@ -52,27 +53,38 @@ PACK_DIR = "/jet/home/jxu23/OCEANDIR/protein_pack"
 # it the dense anchors fall back to the labelled positives
 ALIGNED_COLUMNS_DIR = "/jet/home/jxu23/OCEANDIR/aligned_columns"
 TEACHER_CHECKPOINT = "/jet/home/jxu23/OCEANDIR/teacher_checkpoints/teacher_best.pt"
-# student_checkpoints holds the first run (embedding distillation, no dense
-# pairs), kept as the baseline
-CHECKPOINT_DIR = "/jet/home/jxu23/OCEANDIR/student_checkpoints_dense"
+
+# Run settings, overridable from the environment so comparison runs can be
+# submitted side by side without editing this file, e.g.
+#   sbatch --export=ALL,MODEL=student,STUDENT_ESM=650M,RUN_NAME=dense_650M train.sh
+# STUDENT_ESM  the ESM-2 model the student reads (common.ESM_MODELS); the
+#              teacher's patches always use the pipeline's 35M features
+# TRAIN_PAIRS  train on the first N training pairs only; unset trains on all
+# RUN_NAME     checkpoints go to student_checkpoints_<RUN_NAME>; "dense" is the
+#              full run, and student_checkpoints/ holds the first run (embedding
+#              distillation, no dense pairs), kept as the baseline
+STUDENT_ESM = os.environ.get("STUDENT_ESM", BASE_ESM)
+RUN_NAME = os.environ.get("RUN_NAME", "dense")
+CHECKPOINT_DIR = f"/jet/home/jxu23/OCEANDIR/student_checkpoints_{RUN_NAME}"
 LATEST_CHECKPOINT_NAME = "student_latest.pt"
+STUDENT_EMBEDDING_DIR, STUDENT_PACK_DIR = esm_dirs(STUDENT_ESM)
 
 CSV_CHUNK_SIZE = 5000
 GROUPS_PER_BUFFER = 256
-MAX_GROUPS = None
+MAX_GROUPS = int(os.environ["TRAIN_PAIRS"]) if os.environ.get("TRAIN_PAIRS") else None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 7
 
 BATCH_SIZE = 4  # protein pairs per step
-EPOCHS = 10
+EPOCHS = int(os.environ.get("EPOCHS", 10))
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.02  # matrices only; biases, norms, calibration and balancer are exempt
 GRAD_CLIP = 1.0
 LOG_EVERY_BATCHES = 20
 
 MAX_SEQ_LENGTH = 1000
-INPUT_DIM = 480
+INPUT_DIM = ESM_MODELS[STUDENT_ESM][1]
 HIDDEN_DIM = 256
 NUM_LAYERS = 4
 NUM_HEADS = 8
@@ -125,6 +137,7 @@ CONFIG_FINGERPRINT = {
     "loss_balance": LOSS_BALANCE,
     "w_dense": W_DENSE,
     "dense": vars(DENSE),
+    "student_esm": STUDENT_ESM,
     "hidden_dim": HIDDEN_DIM,
     "num_layers": NUM_LAYERS,
     "num_heads": NUM_HEADS,
@@ -198,7 +211,9 @@ def load_resume_state(model, balancer, optimizer):
     )
 
 
-def make_dataset(groups, cache, extra_distill_residues=0, dense=None, aligned_columns=None):
+def make_dataset(
+    groups, cache, extra_distill_residues=0, dense=None, aligned_columns=None, student_features=None
+):
     return ProteinPairDataset(
         groups,
         cache,
@@ -207,7 +222,21 @@ def make_dataset(groups, cache, extra_distill_residues=0, dense=None, aligned_co
         extra_distill_residues=extra_distill_residues,
         dense=dense,
         aligned_columns=aligned_columns,
+        student_features=student_features,
     )
+
+
+def student_feature_store(student_esm):
+    """The student's input embeddings when they are not the 35M ones, else None."""
+    if student_esm == BASE_ESM:
+        return None
+    embedding_dir, pack_dir = esm_dirs(student_esm)
+    if not os.path.isdir(embedding_dir) and not os.path.isdir(pack_dir):
+        raise FileNotFoundError(
+            f"no {student_esm} embeddings at {embedding_dir} or {pack_dir}; "
+            f"embed with data_scripts/embed.sh (ESM_MODEL={student_esm})"
+        )
+    return EmbeddingStore(embedding_dir, pack_dir, max_size=PROTEIN_CACHE_SIZE)
 
 
 def build_balancer():
@@ -380,7 +409,16 @@ def compute_losses(student_out, teacher_z1, teacher_z2, batch, balancer, teacher
 
 
 def train_on_buffer(
-    student, teacher, balancer, optimizer, groups, cache, epoch, buffer_idx, aligned_columns=None
+    student,
+    teacher,
+    balancer,
+    optimizer,
+    groups,
+    cache,
+    epoch,
+    buffer_idx,
+    aligned_columns=None,
+    student_features=None,
 ):
     dataset = make_dataset(
         groups,
@@ -388,6 +426,7 @@ def train_on_buffer(
         EXTRA_DISTILL_RESIDUES,
         dense=DENSE if W_DENSE > 0 else None,
         aligned_columns=aligned_columns,
+        student_features=student_features,
     )
     loader = pair_loader(dataset, BATCH_SIZE, shuffle=True, workers=LOADER_WORKERS)
 
@@ -454,7 +493,7 @@ def train_on_buffer(
 
 
 @torch.no_grad()
-def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
+def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS, student_features=None):
     student.eval()
     fgw_pred, fgw_true, fgw_type = [], [], []
     tm_pred, tm_true, tm2_pred, tm2_true = [], [], [], []
@@ -468,7 +507,10 @@ def validate(student, teacher, cache, max_groups=VAL_MAX_GROUPS):
         max_groups=max_groups,
     ):
         loader = pair_loader(
-            make_dataset(groups, cache), BATCH_SIZE, shuffle=False, workers=LOADER_WORKERS
+            make_dataset(groups, cache, student_features=student_features),
+            BATCH_SIZE,
+            shuffle=False,
+            workers=LOADER_WORKERS,
         )
         for batch in loader:
             if batch is None:
@@ -608,6 +650,7 @@ def save_checkpoint(
                 "gw_label_scale": GW_LABEL_SCALE,
                 "fgw_label_scale": FGW_LABEL_SCALE,
                 "loss_balance": LOSS_BALANCE,
+                "student_esm": STUDENT_ESM,
                 "dropout": DROPOUT,
                 "weight_decay": WEIGHT_DECAY,
                 "extra_distill_residues": EXTRA_DISTILL_RESIDUES,
@@ -627,6 +670,10 @@ def main():
     log(f"FGW CSV: {FGW_CSV}")
     log(f"Teacher: {TEACHER_CHECKPOINT}")
     log(f"Checkpoint dir: {CHECKPOINT_DIR}")
+    log(
+        f"Student input: ESM-2 {STUDENT_ESM} ({INPUT_DIM} dimensions); "
+        f"training pairs: {MAX_GROUPS or 'all'}; epochs: {EPOCHS}"
+    )
     log(f"Device: {DEVICE}")
     log(f"Protein pairs per batch: {BATCH_SIZE}")
     log(f"Loader workers: {LOADER_WORKERS}")
@@ -651,6 +698,7 @@ def main():
     np.random.seed(SEED)
 
     teacher, teacher_config = load_teacher()
+    student_features = student_feature_store(STUDENT_ESM)
 
     aligned_columns = open_aligned_columns(ALIGNED_COLUMNS_DIR)
     if W_DENSE > 0:
@@ -719,13 +767,14 @@ def main():
                 epoch,
                 buffer_idx,
                 aligned_columns=aligned_columns,
+                student_features=student_features,
             )
             epoch_loss += buffer_loss * n
             epoch_examples += n
 
             if VALIDATE_EVERY_BUFFERS and buffer_idx % VALIDATE_EVERY_BUFFERS == 0:
                 log_validation(
-                    validate(student, teacher, cache),
+                    validate(student, teacher, cache, student_features=student_features),
                     f"epoch {epoch} buffer {buffer_idx}:",
                 )
 
@@ -757,7 +806,9 @@ def main():
             raise ValueError("No training examples processed")
 
         avg_loss = epoch_loss / epoch_examples
-        val_metrics = validate(student, teacher, cache, max_groups=None)
+        val_metrics = validate(
+            student, teacher, cache, max_groups=None, student_features=student_features
+        )
         log(f"epoch {epoch} finished: train loss={avg_loss:.6f}")
         log_validation(val_metrics, f"epoch {epoch}:")
         if cache.lookups():  # loader workers keep their own caches

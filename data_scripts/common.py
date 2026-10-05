@@ -14,6 +14,33 @@ def embedding_path(embedding_dir, uniprot_id):
     return os.path.join(embedding_dir, f"{uniprot_id}.npy")
 
 
+DATA_DIR = "/jet/home/jxu23/OCEANDIR"
+
+# ESM-2 checkpoints by short name: (fair-esm model name, embedding width).
+# 35M is the pipeline's own: the teacher's patch features, the labels'
+# feature term and the pack all use it. The larger ones are student inputs.
+ESM_MODELS = {
+    "35M": ("esm2_t12_35M_UR50D", 480),
+    "150M": ("esm2_t30_150M_UR50D", 640),
+    "650M": ("esm2_t33_650M_UR50D", 1280),
+    "3B": ("esm2_t36_3B_UR50D", 2560),
+}
+BASE_ESM = "35M"
+
+
+def esm_dirs(tag, data_dir=DATA_DIR):
+    """(embedding dir, pack dir) for an ESM_MODELS short name.
+
+    35M keeps the original embeddings/ and protein_pack/; any other model
+    gets its own, so nothing the pipeline depends on is overwritten.
+    """
+    if tag not in ESM_MODELS:
+        raise ValueError(f"unknown ESM-2 model {tag!r}, expected one of {sorted(ESM_MODELS)}")
+    if tag == BASE_ESM:
+        return os.path.join(data_dir, "embeddings"), os.path.join(data_dir, "protein_pack")
+    return os.path.join(data_dir, f"embeddings_{tag}"), os.path.join(data_dir, f"protein_pack_{tag}")
+
+
 def write_progress(progress_file, row_idx):
     """Record the last row processed, so a shard can be resumed."""
     progress_dir = os.path.dirname(progress_file)

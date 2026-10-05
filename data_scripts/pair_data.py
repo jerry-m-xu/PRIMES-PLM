@@ -191,6 +191,36 @@ class ProteinDataCache:
         return self.hits + self.misses
 
 
+class EmbeddingStore:
+    """Another ESM-2 model's per-residue embeddings, for the student's input only.
+
+    The teacher's patch features stay the pipeline's own 35M embeddings from
+    ProteinDataCache; this supplies what the student reads instead. Reads its
+    pack when there is one (protein_pack.py --model ...), else the .npy files.
+    """
+
+    def __init__(self, embedding_dir, pack_dir=None, max_size=512):
+        self.embedding_dir = embedding_dir
+        self.max_size = max_size
+        self.cache = OrderedDict()
+        self.pack = open_pack(pack_dir)
+
+    def get(self, uniprot_id):
+        if uniprot_id in self.cache:
+            self.cache.move_to_end(uniprot_id)
+            return self.cache[uniprot_id]
+        packed = self.pack.get(uniprot_id) if self.pack is not None else None
+        if packed is not None:
+            embeddings = packed[1]
+        else:
+            embeddings = np.load(embedding_path(self.embedding_dir, uniprot_id))
+        value = embeddings.astype(np.float32)
+        self.cache[uniprot_id] = value
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+        return value
+
+
 def loader_workers(limit=8):
     """Processes for building batches: this job's CPUs minus one for training."""
     try:
@@ -296,6 +326,7 @@ class ProteinPairDataset(Dataset):
         extra_distill_residues=0,
         dense=None,
         aligned_columns=None,
+        student_features=None,
         skip_errors=True,
     ):
         self.groups = groups
@@ -305,6 +336,8 @@ class ProteinPairDataset(Dataset):
         self.extra_distill_residues = extra_distill_residues
         self.dense = dense  # DenseConfig, or None for no dense pairs
         self.aligned_columns = aligned_columns  # aligned_columns.AlignedColumns or None
+        # EmbeddingStore for the student's input, or None to use the 35M features
+        self.student_features = student_features
         self.rng = np.random.default_rng()
         self.skip_errors = skip_errors
         self.errors = []
@@ -385,8 +418,17 @@ class ProteinPairDataset(Dataset):
                 raise ValueError(
                     f"{id1}/{id2}: sequence longer than {self.max_seq_length}"
                 )
-            item["features1"] = features1
-            item["features2"] = features2
+            sequence1, sequence2 = features1, features2
+            if self.student_features is not None:
+                sequence1 = self.student_features.get(id1)
+                sequence2 = self.student_features.get(id2)
+                if len(sequence1) != len(coords1) or len(sequence2) != len(coords2):
+                    raise ValueError(
+                        f"{id1}/{id2}: student embeddings have {len(sequence1)}/"
+                        f"{len(sequence2)} residues, structures {len(coords1)}/{len(coords2)}"
+                    )
+            item["features1"] = sequence1
+            item["features2"] = sequence2
             item["residue_idx1"] = residue_idx1
             item["residue_idx2"] = residue_idx2
 
@@ -514,8 +556,10 @@ def collate_pairs(items):
         max_len = max(
             max(len(item["features1"]), len(item["features2"])) for item in items
         )
+        # the student's input can come from a wider ESM-2 than the patches
+        sequence_dim = items[0]["features1"].shape[-1]
         for side in ("1", "2"):
-            out[f"features{side}"] = torch.zeros(batch_size, max_len, feature_dim)
+            out[f"features{side}"] = torch.zeros(batch_size, max_len, sequence_dim)
             out[f"seq_mask{side}"] = torch.zeros(
                 batch_size, max_len, dtype=torch.bool
             )

@@ -4,6 +4,11 @@
     python data_scripts/protein_pack.py               # proteins in fgw_scores.csv not yet packed
     python data_scripts/protein_pack.py --all         # every protein with an embedding
     python data_scripts/protein_pack.py --rebuild     # start over, e.g. after regenerating embeddings
+    python data_scripts/protein_pack.py --model 650M  # another model's embeddings, same proteins
+
+--model packs another ESM-2 model's embeddings (embeddings_<model>/) into its
+own protein_pack_<model>/, for the student's input. Its coordinates are copied
+from the 35M pack rather than parsed from the PDBs again.
 
 Why: training reads two proteins per pair. From per-protein files on the
 shared filesystem that cost ~170 ms to parse a PDB and ~40 ms to open one
@@ -43,7 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from common import embedding_path, log, pdb_path  # noqa: E402
+from common import BASE_ESM, ESM_MODELS, embedding_path, esm_dirs, log, pdb_path  # noqa: E402
 from parse_pdb import parse_pdb  # noqa: E402
 
 DATA_DIR = "/jet/home/jxu23/OCEANDIR"
@@ -198,10 +203,18 @@ def write_manifest(pack_dir, embedding_dim, pdb_dir, embedding_dir):
     os.replace(path + ".tmp", path)
 
 
-def read_protein(protein_id, pdb_dir, embedding_dir, embedding_dim):
-    """(coords, embeddings), or (None, reason) when the protein cannot be packed."""
+def read_protein(protein_id, pdb_dir, embedding_dir, embedding_dim, coords_pack=None):
+    """(coords, embeddings), or (None, reason) when the protein cannot be packed.
+
+    coords_pack, a ProteinPack, supplies the coordinates when it holds the
+    protein; they are parse_pdb's, byte for byte, without the parse.
+    """
     try:
-        coords, _ = parse_pdb(pdb_path(pdb_dir, protein_id))
+        packed = coords_pack.get(protein_id) if coords_pack is not None else None
+        if packed is not None:
+            coords = packed[0]
+        else:
+            coords, _ = parse_pdb(pdb_path(pdb_dir, protein_id))
         embeddings = np.load(embedding_path(embedding_dir, protein_id))
     except Exception as exc:
         return None, type(exc).__name__
@@ -218,7 +231,9 @@ def read_protein(protein_id, pdb_dir, embedding_dir, embedding_dim):
 
 def pack_shard(task):
     """Write one shard. Returns (shard, packed count, {skip reason: count})."""
-    number, protein_ids, pdb_dir, embedding_dir, pack_dir, embedding_dim, log_every = task
+    (number, protein_ids, pdb_dir, embedding_dir, pack_dir, embedding_dim, log_every,
+     coords_pack_dir) = task
+    coords_pack = ProteinPack(coords_pack_dir) if coords_pack_dir else None
     shard = f"shard_{number:05d}"
     coords_path, emb_path, index_path = shard_paths(pack_dir, shard)
     packed, skipped, row = 0, Counter(), 0
@@ -230,7 +245,9 @@ def pack_shard(task):
         index_file.write("id,row,length\n")
         index_file.flush()
         for done, protein_id in enumerate(protein_ids, start=1):
-            data, reason = read_protein(protein_id, pdb_dir, embedding_dir, embedding_dim)
+            data, reason = read_protein(
+                protein_id, pdb_dir, embedding_dir, embedding_dim, coords_pack
+            )
             if data is None:
                 skipped[reason] += 1
             else:
@@ -250,7 +267,7 @@ def pack_shard(task):
 
 
 def pack_proteins(protein_ids, pdb_dir, embedding_dir, pack_dir, workers=1,
-                  embedding_dim=EMBEDDING_DIM, log_every=2000):
+                  embedding_dim=EMBEDDING_DIM, log_every=2000, coords_pack_dir=None):
     """Pack the proteins not already in pack_dir. Returns (packed, {reason: count}, shards)."""
     os.makedirs(pack_dir, exist_ok=True)
     write_manifest(pack_dir, embedding_dim, pdb_dir, embedding_dir)
@@ -263,7 +280,8 @@ def pack_proteins(protein_ids, pdb_dir, embedding_dir, pack_dir, workers=1,
     num_shards = max(1, min(workers, len(todo)))
     first = next_shard_number(pack_dir)
     tasks = [
-        (first + k, todo[k::num_shards], pdb_dir, embedding_dir, pack_dir, embedding_dim, log_every)
+        (first + k, todo[k::num_shards], pdb_dir, embedding_dir, pack_dir, embedding_dim, log_every,
+         coords_pack_dir)
         for k in range(num_shards)
     ]
     if workers > 1:
@@ -332,21 +350,38 @@ def main():
     parser.add_argument("--csv", default=None, help="default: <data-dir>/fgw_scores.csv")
     parser.add_argument("--all", action="store_true", help="pack every protein with an embedding")
     parser.add_argument("--workers", type=int, default=default_workers())
-    parser.add_argument("--embedding-dim", type=int, default=EMBEDDING_DIM)
+    parser.add_argument("--model", default=BASE_ESM, choices=sorted(ESM_MODELS),
+                        help="whose embeddings to pack; sets the embedding dir, pack dir and width")
+    parser.add_argument("--protein-list", default=None,
+                        help="pack only these proteins (one id per line)")
+    parser.add_argument("--embedding-dim", type=int, default=None, help="default: by model")
     parser.add_argument("--verify", type=int, default=200, help="proteins to check exactly; 0 skips")
     parser.add_argument("--rebuild", action="store_true", help="delete the existing pack first")
     args = parser.parse_args()
 
     pdb_dir = os.path.join(args.data_dir, "pdbs")
-    embedding_dir = os.path.join(args.data_dir, "embeddings")
-    pack_dir = args.pack_dir or os.path.join(args.data_dir, "protein_pack")
+    embedding_dir, default_pack_dir = esm_dirs(args.model, args.data_dir)
+    pack_dir = args.pack_dir or default_pack_dir
+    embedding_dim = args.embedding_dim or ESM_MODELS[args.model][1]
     csv_path = args.csv or os.path.join(args.data_dir, "fgw_scores.csv")
+    # another model's pack copies its coordinates from the 35M pack
+    base_pack_dir = esm_dirs(BASE_ESM, args.data_dir)[1]
+    coords_pack_dir = None
+    if os.path.abspath(pack_dir) != os.path.abspath(base_pack_dir) and os.path.exists(
+        os.path.join(base_pack_dir, MANIFEST)
+    ):
+        coords_pack_dir = base_pack_dir
+        log(f"coordinates from {base_pack_dir}")
 
     if args.rebuild and os.path.isdir(pack_dir):
         log(f"--rebuild: removed {remove_pack(pack_dir)} files from {pack_dir}")
 
     start = time.time()
-    if args.all:
+    if args.protein_list:
+        with open(args.protein_list) as handle:
+            protein_ids = {line.strip() for line in handle if line.strip() and not line.startswith("#")}
+        log(f"{len(protein_ids):,} proteins in {args.protein_list}")
+    elif args.all:
         protein_ids = {name[:-4] for name in os.listdir(embedding_dir) if name.endswith(".npy")}
         log(f"{len(protein_ids):,} proteins with an embedding in {embedding_dir}")
     else:
@@ -355,7 +390,7 @@ def main():
 
     packed, skipped, shards = pack_proteins(
         protein_ids, pdb_dir, embedding_dir, pack_dir, workers=args.workers,
-        embedding_dim=args.embedding_dim,
+        embedding_dim=embedding_dim, coords_pack_dir=coords_pack_dir,
     )
     total = len(load_index(pack_dir))
     size = sum(
