@@ -1,5 +1,5 @@
 node_modules/
-__pycache__/tm_vec/tm_vec_swiss_model.ckpt
+__pycache__/
 
 # python
 __pycache__/
