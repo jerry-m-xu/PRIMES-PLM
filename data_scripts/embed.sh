@@ -29,7 +29,10 @@
 
 set -euo pipefail
 
-DATA_DIR="${DATA_DIR:-/jet/home/jxu23/OCEANDIR}"
+# Not read from $DATA_DIR: psc_interactive_setup.sh exports DATA_DIR for the
+# old preprint layout (training_data/), and a shell that sourced it would
+# pass that along. Set PIPELINE_DATA_DIR to override.
+DATA_DIR="${PIPELINE_DATA_DIR:-/jet/home/jxu23/OCEANDIR}"
 # Under sbatch, BASH_SOURCE is a copy in SLURM's spool directory, so the repo
 # root is taken from the submitted script's path (scontrol) or, failing that,
 # from the directory sbatch was run in. Set REPO_DIR to override.
@@ -68,6 +71,7 @@ fi
 # A batch job does not inherit an interactively-activated venv. Source the
 # project setup from the repo or the home directory, or point VENV at an
 # activate script yourself.
+_PIPELINE_DATA_DIR="$DATA_DIR"
 if [ -n "${VENV:-}" ]; then
     # shellcheck disable=SC1090
     source "$VENV"
@@ -78,6 +82,7 @@ elif [ -f "$HOME/psc_interactive_setup.sh" ]; then
     # shellcheck disable=SC1091
     source "$HOME/psc_interactive_setup.sh"
 fi
+DATA_DIR="$_PIPELINE_DATA_DIR"  # the setup script exports its own DATA_DIR
 if ! command -v python >/dev/null 2>&1; then
     echo "python not found after environment setup." >&2
     echo "Set VENV=/path/to/venv/bin/activate, or put psc_interactive_setup.sh in the repo or your home directory." >&2
