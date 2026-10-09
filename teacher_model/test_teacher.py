@@ -46,8 +46,10 @@ from train_teacher import (  # noqa: E402
 )
 
 # global config
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "teacher_best.pt")
-SPLIT = "test"
+# CHECKPOINT and SPLIT override from the environment; per-pair predictions are
+# saved next to the checkpoint (PREDICTIONS overrides) for error_report.py
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT", os.path.join(CHECKPOINT_DIR, "teacher_best.pt"))
+SPLIT = os.environ.get("SPLIT", "test")
 EVAL_BATCH_SIZE = 16
 GROUPS_PER_BUFFER = 256
 PROTEIN_CACHE_SIZE = 512
@@ -81,6 +83,7 @@ def load_model(checkpoint_path):
 @torch.no_grad()
 def evaluate(model, cache):
     fgw_pred, tm_pred, tm_true, pair_types = [], [], [], []
+    residue_rows, pair_rows, tm2_true = [], [], []
     targets = {"structure": [], "composite": [], "tm_term": []}
     esm_baseline = []
     skipped = 0
@@ -118,6 +121,9 @@ def evaluate(model, cache):
                 targets["tm_term"].append(batch["tm_term"][mask].cpu().numpy())
                 pair_types.append(batch["pair_type"][mask].cpu().numpy())
                 esm_baseline.append(esm_baseline_similarity(batch)[mask].cpu().numpy())
+                residue_rows.append(batch["row"][:, None].expand_as(mask)[mask].cpu().numpy())
+                pair_rows.append(batch["row"].cpu().numpy())
+                tm2_true.append(clip_unit(batch["tm2"], CLIP_TARGETS).cpu().numpy())
                 if "tm_score_pred" in outputs:
                     tm_pred.append(outputs["tm_score_pred"].cpu().numpy())
                     tm_true.append(clip_unit(batch["tm"], CLIP_TARGETS).cpu().numpy())
@@ -134,8 +140,38 @@ def evaluate(model, cache):
         "pair_types": np.concatenate(pair_types),
         "esm_baseline": np.concatenate(esm_baseline),
         "tm": (np.concatenate(tm_pred), np.concatenate(tm_true)) if tm_pred else None,
+        "residue_rows": np.concatenate(residue_rows),
+        "pair_rows": np.concatenate(pair_rows),
+        "tm2_true": np.concatenate(tm2_true),
         "skipped": skipped,
     }
+
+
+def save_predictions(results, checkpoint):
+    """Every prediction with its target, for data_scripts/error_report.py."""
+    path = os.environ.get("PREDICTIONS") or os.path.join(
+        os.path.dirname(CHECKPOINT_PATH), f"teacher_{SPLIT}_predictions.npz"
+    )
+    arrays = {
+        "model": np.array("teacher"),
+        "split": np.array(SPLIT),
+        "checkpoint": np.array(CHECKPOINT_PATH),
+        "epoch": np.array(checkpoint.get("epoch", -1)),
+        "res_row": results["residue_rows"],
+        "res_type": results["pair_types"],
+        "res_pred": results["fgw_pred"],
+        "res_pis": results["targets"]["structure"],
+        "res_composite": results["targets"]["composite"],
+        "res_tm_term": results["targets"]["tm_term"],
+        "res_esm": results["esm_baseline"],
+        "pair_row": results["pair_rows"],
+    }
+    if results["tm"] is not None:
+        arrays["pair_tm_pred"], arrays["pair_tm"] = results["tm"]
+    # the head predicts TM_P only; TM_Q is saved as a target for error_report.py --tm-target max
+    arrays["pair_tm2"] = results["tm2_true"]
+    np.savez_compressed(path, **arrays)
+    return path
 
 
 def main():
@@ -187,7 +223,9 @@ def main():
         f"{trained_on} target by pair type (aligned = on TM-align's path)",
     )
     report_by_bucket(predictions, trained_targets)
+    path = save_predictions(results, checkpoint)
     log("")
+    log(f"  per-pair predictions saved to {path}")
     log(f"  skipped batches  {results['skipped']}")
     if cache.lookups():  # loader workers keep their own caches
         log(f"  cache hit rate   {cache.hit_rate():.1%}")

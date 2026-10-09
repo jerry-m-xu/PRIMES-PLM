@@ -87,6 +87,7 @@ def load_student(checkpoint_path):
 def evaluate(student, teacher, cache, student_features=None):
     fgw_pred, tm_pred, tm_true, tm2_pred, tm2_true, agreement = [], [], [], [], [], []
     pair_types = []
+    residue_rows, pair_rows = [], []
     targets = {"structure": [], "composite": [], "tm_term": []}
     esm_baseline = []
     skipped = 0
@@ -127,6 +128,8 @@ def evaluate(student, teacher, cache, student_features=None):
                 targets["tm_term"].append(batch["tm_term"][mask].cpu().numpy())
                 pair_types.append(batch["pair_type"][mask].cpu().numpy())
                 esm_baseline.append(esm_baseline_similarity(batch)[mask].cpu().numpy())
+                residue_rows.append(batch["row"][:, None].expand_as(mask)[mask].cpu().numpy())
+                pair_rows.append(batch["row"].cpu().numpy())
                 if "tm_score_pred" in out:
                     tm_pred.append(out["tm_score_pred"].cpu().numpy())
                     tm_true.append(clip_unit(batch["tm"], CLIP_TARGETS).cpu().numpy())
@@ -153,8 +156,36 @@ def evaluate(student, teacher, cache, student_features=None):
         "tm": (np.concatenate(tm_pred), np.concatenate(tm_true)) if tm_pred else None,
         "tm2": (np.concatenate(tm2_pred), np.concatenate(tm2_true)) if tm2_pred else None,
         "agreement": np.concatenate(agreement) if agreement else None,
+        "residue_rows": np.concatenate(residue_rows),
+        "pair_rows": np.concatenate(pair_rows),
         "skipped": skipped,
     }
+
+
+def save_predictions(results, checkpoint):
+    """Every prediction with its target, for data_scripts/error_report.py."""
+    path = os.environ.get("PREDICTIONS") or os.path.join(
+        os.path.dirname(CHECKPOINT_PATH), f"student_{SPLIT}_predictions.npz"
+    )
+    arrays = {
+        "model": np.array("student"),
+        "split": np.array(SPLIT),
+        "checkpoint": np.array(CHECKPOINT_PATH),
+        "epoch": np.array(checkpoint.get("epoch", -1)),
+        "res_row": results["residue_rows"],
+        "res_type": results["pair_types"],
+        "res_pred": results["fgw_pred"],
+        "res_pis": results["targets"]["structure"],
+        "res_composite": results["targets"]["composite"],
+        "res_tm_term": results["targets"]["tm_term"],
+        "res_esm": results["esm_baseline"],
+        "pair_row": results["pair_rows"],
+    }
+    if results["tm"] is not None:
+        arrays["pair_tm_pred"], arrays["pair_tm"] = results["tm"]
+        arrays["pair_tm2_pred"], arrays["pair_tm2"] = results["tm2"]
+    np.savez_compressed(path, **arrays)
+    return path
 
 
 def main():
@@ -224,7 +255,9 @@ def main():
         log(f"    10th pct       {np.percentile(agreement, 10):.4f}")
         log(f"    below 0.5      {(agreement < 0.5).mean():.1%}")
 
+    path = save_predictions(results, checkpoint)
     log("")
+    log(f"  per-pair predictions saved to {path}")
     log(f"  skipped batches  {results['skipped']}")
     if cache.lookups():  # loader workers keep their own caches
         log(f"  cache hit rate   {cache.hit_rate():.1%}")
