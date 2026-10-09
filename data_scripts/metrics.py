@@ -145,8 +145,11 @@ def report_esm_baseline(baseline, predictions, targets_by_name):
     """How much of each target is recoverable from the input alone?"""
     log("")
     log("  ESM-cosine baseline (no training, input only)")
-    log(f"  {'target':<22}{'baseline R^2':>14}{'model R^2':>12}")
+    log(f"  {'target':<14}{'baseline MSE':>14}{'R^2':>9}{'r':>9}{'model MSE':>12}{'R^2':>9}{'r':>9}")
     for name, targets in targets_by_name.items():
-        baseline_r2 = compute_metrics(baseline, targets)["r2"]
-        model_r2 = compute_metrics(predictions, targets)["r2"]
-        log(f"  {name:<22}{baseline_r2:>14.4f}{model_r2:>12.4f}")
+        base = compute_metrics(baseline, targets)
+        model = compute_metrics(predictions, targets)
+        log(
+            f"  {name:<14}{base['mse']:>14.4f}{base['r2']:>9.4f}{base['pearson']:>9.4f}"
+            f"{model['mse']:>12.4f}{model['r2']:>9.4f}{model['pearson']:>9.4f}"
+        )

@@ -408,6 +408,8 @@ class ProteinPairDataset(Dataset):
             ),
             "tm": np.float32(group["tm_score_norm1"].iloc[0]),
             "tm2": np.float32(group["tm_score_norm2"].iloc[0]),
+            # the pair's tm_scores.csv row, so evaluations can save per-pair results
+            "row": np.int64(group["tm_data_row"].iloc[0]),
         }
 
         if self.include_sequence:
@@ -490,6 +492,7 @@ def collate_pairs(items):
     out = {
         "tm": torch.zeros(batch_size),
         "tm2": torch.zeros(batch_size),
+        "row": torch.zeros(batch_size, dtype=torch.long),
         "fgw": torch.zeros(batch_size, max_residues),
         "fgw_structure": torch.zeros(batch_size, max_residues),
         "tm_term": torch.zeros(batch_size, max_residues),
@@ -571,6 +574,7 @@ def collate_pairs(items):
         num_residues = len(item["fgw"])
         out["tm"][i] = float(item["tm"])
         out["tm2"][i] = float(item["tm2"])
+        out["row"][i] = int(item["row"])
         out["fgw"][i, :num_residues] = torch.from_numpy(item["fgw"])
         out["fgw_structure"][i, :num_residues] = torch.from_numpy(
             item["fgw_structure"]
