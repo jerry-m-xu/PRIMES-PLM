@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """TM-Vec's TM-score predictions for our test pairs, in error_report.py's format.
 
-    python baselines/tmvec_predict.py --checkpoint $D/tm_vec_swiss_model.ckpt
-    python baselines/tmvec_predict.py --checkpoint ... --config tm_vec_swiss_model_params.json
+    python baselines/tmvec_predict.py --checkpoint $D/tm_vec_swiss_model_large.ckpt \
+        --config $D/tm_vec_swiss_model_large_params.json
     python baselines/tmvec_predict.py --checkpoint ... --split val --max-pairs 2000
+
+Checkpoints: TM-Vec's models are on Figshare (https://figshare.com/s/e414d6a52fd471d86d69,
+linked from https://github.com/tymor22/tm-vec). Use tm_vec_swiss_model_large, trained on
+SWISS-MODEL chains up to 1000 residues like ours, with its params JSON; the base
+tm_vec_swiss_model was trained on chains up to 300 residues.
 
 TM-Vec (Hamamsy et al., 2024) embeds each sequence with ProtT5-XL, passes the
 per-residue embeddings through its transformer, and predicts the TM-score of
@@ -42,6 +47,7 @@ for _path in (HERE, os.path.join(REPO_ROOT, "data_scripts")):
         sys.path.insert(0, _path)
 
 from common import DATA_DIR, log  # noqa: E402
+from metrics import report  # noqa: E402
 
 FGW_CSV = os.path.join(DATA_DIR, "fgw_scores.csv")
 TM_SCORES_CSV = os.path.join(DATA_DIR, "tm_scores.csv")
@@ -174,9 +180,19 @@ def main():
     with open(timing_path, "w") as handle:
         json.dump(timing, handle, indent=2)
 
-    tm_max = np.maximum([p[3] for p in pairs], [p[4] for p in pairs])
-    log(f"MAE against TM-score by protein 1: {np.mean(np.abs(predictions - [p[3] for p in pairs])):.4f}; "
-        f"against the larger TM-score: {np.mean(np.abs(predictions - tm_max)):.4f}")
+    # the same statistics as test_teacher.py and test_student.py, for each target
+    tm_p = np.array([p[3] for p in pairs]); tm_q = np.array([p[4] for p in pairs])
+    log("")
+    log("=" * 60)
+    for title, target in (("TM-score normalised by protein 1 (TM_P)", tm_p),
+                          ("TM-score normalised by protein 2 (TM_Q)", tm_q),
+                          ("larger of the two TM-scores (what TM-Vec predicts)", np.maximum(tm_p, tm_q))):
+        report(f"TM-Vec vs {title}", predictions, target)
+        log(f"    median |error| {np.median(np.abs(predictions - target)):.6f}")
+    log("")
+    log(f"  embedding: median {timing['steps']['embed_tmvec']['median_s'] * 1e3:.1f} ms per protein; "
+        f"comparison: median {timing['steps']['compare_tmvec']['median_s'] * 1e6:.1f} us per pair")
+    log("=" * 60)
     log(f"wrote {out} and {timing_path}")
 
 
