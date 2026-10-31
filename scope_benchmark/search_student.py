@@ -13,16 +13,21 @@ scored in blocks of similar length, so padding stays small:
   tm_max   the larger of its two normalisations
   pooled   the cosine of the two pooled embeddings: the cheap screening score
 
+and, as the baseline the student has to beat, the cosine of ESM-2's own
+mean-pooled embeddings: the student's input, without the student.
+
 For each score, the best --top hits of every query (2000, the depth the
-benchmark gives Foldseek and MMseqs2) go to hits/<name>_<score>.tsv.gz, best
-first, and evaluate_search.py's sensitivities are printed. Wall times go to
+benchmark gives Foldseek and MMseqs2) go to hits/<name>_<score>.tsv.gz, and
+the baseline's to hits/esm2_<model>_pooled.tsv.gz, best first; then
+evaluate_search.py's sensitivities are printed. Wall times go to
 hits/timing.json.
 
 The inputs follow training: the ESM-2 model the checkpoint was trained on, its
 last layer, rounded through float16 as precompute_esm.py stores it, and at
 most MAX_SEQ_LENGTH residues; the few longer domains are truncated. The
-student's embeddings are cached in hits/<name>_embeddings.pt with the
-checkpoint's path and modification time, so a rerun skips ESM-2.
+student's embeddings and ESM-2's pooled ones are cached in
+hits/<name>_embeddings.pt with the checkpoint's path and modification time,
+so a rerun skips ESM-2.
 """
 
 import argparse
@@ -76,37 +81,48 @@ def load_student(path, device):
     return student, tag, checkpoint.get("epoch")
 
 
+def esm_features(sequence, model, converter, device):
+    """ESM-2's last layer for one sequence as the student sees it, [1, L, E] float32 on device."""
+    from embed_esm2 import get_esm_embeddings
+
+    features = get_esm_embeddings(sequence[:MAX_SEQ_LENGTH], model, converter, device=str(device))
+    return torch.from_numpy(features.astype(np.float16).astype(np.float32)).to(device)[None]
+
+
 @torch.no_grad()
 def embed(student, tag, sequences, device):
-    """Each sequence's per-residue student embeddings, [L, D] float32 on the CPU."""
-    from embed_esm2 import get_esm_embeddings, load_esm
+    """(each sequence's per-residue student embeddings, [L, D] float32 on the CPU;
+    ESM-2's mean-pooled embeddings, normalised, [N, E] on the CPU)."""
+    from embed_esm2 import load_esm
 
     model, _, converter = load_esm(ESM_MODELS[tag][0], device=str(device))
-    embeddings = []
+    embeddings, esm_pooled = [], []
     for k, sequence in enumerate(sequences):
-        features = get_esm_embeddings(sequence[:MAX_SEQ_LENGTH], model, converter, device=str(device))
-        features = torch.from_numpy(features.astype(np.float16).astype(np.float32)).to(device)[None]
+        features = esm_features(sequence, model, converter, device)
         mask = torch.ones(features.shape[:2], dtype=torch.bool, device=device)
         embeddings.append(student(features, mask)[0].cpu())
+        esm_pooled.append(F.normalize(features[0].mean(0), dim=-1).cpu())
         if (k + 1) % 1000 == 0:
             log(f"  embedded {k + 1:,}/{len(sequences):,}")
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    return embeddings
+    return embeddings, torch.stack(esm_pooled)
 
 
 def cached_embeddings(path, checkpoint, domains, compute):
+    """compute()'s (student embeddings, ESM-2 pooled), from the cache when it matches."""
     stamp = {"checkpoint": os.path.abspath(checkpoint), "mtime": os.path.getmtime(checkpoint),
              "domains": list(domains)}
     if os.path.exists(path):
         cache = torch.load(path, weights_only=False)
-        if all(cache.get(key) == value for key, value in stamp.items()):
+        # caches written before the ESM-2 baseline lack esm_pooled
+        if all(cache.get(key) == value for key, value in stamp.items()) and "esm_pooled" in cache:
             log(f"reusing the embeddings in {path}")
-            return cache["embeddings"]
-    embeddings = compute()
-    torch.save({**stamp, "embeddings": embeddings}, path)
-    return embeddings
+            return cache["embeddings"], cache["esm_pooled"]
+    embeddings, esm_pooled = compute()
+    torch.save({**stamp, "embeddings": embeddings, "esm_pooled": esm_pooled}, path)
+    return embeddings, esm_pooled
 
 
 @torch.no_grad()
@@ -209,7 +225,7 @@ def main():
         log(f"{truncated} domains longer than {MAX_SEQ_LENGTH} residues are truncated")
 
     start = time.perf_counter()
-    embeddings = cached_embeddings(
+    embeddings, esm_pooled = cached_embeddings(
         os.path.join(hits_dir, f"{args.name}_embeddings.pt"), args.checkpoint, domains,
         lambda: embed(student, tag, [sequences[d] for d in domains], device))
     embed_seconds = time.perf_counter() - start
@@ -218,14 +234,16 @@ def main():
     scores = score_pairs(student, embeddings, device, args.block_size, args.max_cells)
     score_seconds = time.perf_counter() - start
 
-    variants = {"pooled": scores["pooled"]}
+    variants = {f"{args.name}_pooled": scores["pooled"]}
     if "tm_query" in scores:
-        variants["tm"] = scores["tm_query"]
-        variants["tm_max"] = torch.maximum(scores["tm_query"], scores["tm_target"])
+        variants[f"{args.name}_tm"] = scores["tm_query"]
+        variants[f"{args.name}_tm_max"] = torch.maximum(scores["tm_query"], scores["tm_target"])
+    esm_pooled = esm_pooled.to(device)
+    variants[f"esm2_{tag}_pooled"] = (esm_pooled @ esm_pooled.T).cpu()
     paths = {}
-    for score, matrix in variants.items():
-        paths[f"{args.name}_{score}"] = os.path.join(hits_dir, f"{args.name}_{score}.tsv.gz")
-        write_hits(matrix, domains, paths[f"{args.name}_{score}"], args.top)
+    for name, matrix in variants.items():
+        paths[name] = os.path.join(hits_dir, f"{name}.tsv.gz")
+        write_hits(matrix, domains, paths[name], args.top)
     log(f"wrote {', '.join(paths.values())}")
 
     timing_path = os.path.join(hits_dir, "timing.json")

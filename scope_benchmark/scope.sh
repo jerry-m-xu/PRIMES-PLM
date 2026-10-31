@@ -20,6 +20,8 @@
 #   baselines   search_baselines.py, Foldseek and MMseqs2
 #   student     search_student.py; needs a GPU, so override the partition as above
 #               (options on the sbatch command line win over the #SBATCH lines)
+#   align       align_rerank.py, after student; also on a GPU, and needs numba
+#               in the environment (pip install numba)
 #   evaluate    evaluate_search.py on every hit file, all queries and below MAX_ID
 #
 # Settings, through the environment:
@@ -33,7 +35,7 @@ set -euo pipefail
 # the argument, or STEP exported in the environment
 STEP="${1:-${STEP:-}}"
 if [ -z "$STEP" ]; then
-    echo "no step given: sbatch scope_benchmark/scope.sh <prepare|baselines|student|evaluate>" >&2
+    echo "no step given: sbatch scope_benchmark/scope.sh <prepare|baselines|student|align|evaluate>" >&2
     exit 1
 fi
 OCEAN=/jet/home/jxu23/OCEANDIR
@@ -91,12 +93,14 @@ for step in ${STEP//,/ }; do
         baselines)
             run python -u "$REPO_DIR/scope_benchmark/search_baselines.py" --dir "$SCOPE_DIR" \
                 --foldseek "$FOLDSEEK" --mmseqs "$MMSEQS" --threads "$THREADS" --max-train-identity "$MAX_ID" ;;
-        student)
+        student|align)
             if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
                 echo "no GPU; submit with -p GPU-shared --gpus=v100-32:1 --cpus-per-task=5" >&2
                 exit 1
             fi
-            run python -u "$REPO_DIR/scope_benchmark/search_student.py" --dir "$SCOPE_DIR" \
+            script=search_student.py
+            [ "$step" = align ] && script=align_rerank.py
+            run python -u "$REPO_DIR/scope_benchmark/$script" --dir "$SCOPE_DIR" \
                 --checkpoint "$CHECKPOINT" --name "$NAME" --max-train-identity "$MAX_ID" ;;
         evaluate)
             shopt -s nullglob
@@ -111,7 +115,7 @@ for step in ${STEP//,/ }; do
             run python -u "$REPO_DIR/scope_benchmark/evaluate_search.py" --dir "$SCOPE_DIR" "${hits[@]}" \
                 --max-train-identity "$MAX_ID" --per-query "$SCOPE_DIR/per_query_heldout.tsv" ;;
         *)
-            echo "unknown step '$step' (prepare, baselines, student or evaluate)" >&2
+            echo "unknown step '$step' (prepare, baselines, student, align or evaluate)" >&2
             exit 1 ;;
     esac
 done

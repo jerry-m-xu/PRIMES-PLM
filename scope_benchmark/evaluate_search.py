@@ -74,14 +74,20 @@ def eligible_queries(domains):
     return counts, eligible
 
 
-def evaluate(path, domains, queries=None):
+def read_hits(path):
+    """A hit file's first two columns, as query and target, in file order."""
+    return pd.read_csv(path, sep="\t", header=None, usecols=[0, 1], names=["query", "target"],
+                       dtype=str, keep_default_na=False)
+
+
+def evaluate(hits, domains, queries=None):
     """Per-query sensitivity at each level, indexed by domain; also the share of unknown targets.
 
+    hits: a hit file, or a DataFrame of query and target in rank order.
     domains: load_domains() indexed by domain. queries: optional set of domains
     to report on; the rest still count as database entries.
     """
-    hits = pd.read_csv(path, sep="\t", header=None, usecols=[0, 1], names=["query", "target"],
-                       dtype=str, keep_default_na=False)
+    hits = read_hits(hits) if isinstance(hits, (str, os.PathLike)) else hits[["query", "target"]].copy()
     known = set(domains.index)
     names = domain_names(pd.unique(pd.concat([hits["query"], hits["target"]])), known)
     hits["query"] = hits["query"].map(names)
