@@ -25,8 +25,10 @@ appear in the TM-score panels and tables only. --tm-target max compares every
 model with the larger of the two TM-scores instead of the one normalised by
 protein 1; TM-Vec predicts a single symmetric number, so that is the fair
 target for it, and models predicting both normalisations use the larger of
-their two predictions. Models that predict only TM_P (the teacher's
-auxiliary head) are left out of the TM-score comparison in that mode.
+their two predictions. A model that predicts only TM_P (the teacher's
+auxiliary head) is still scored against TM_P in that mode: it appears in the
+tables, labelled "vs TM_P", but not in the TM-score figure panels, which
+compare models on a single target.
 
 The tables break the error down by the pair's TM-score and by its sequence
 identity over the TM-align alignment (identical residues / aligned residues,
@@ -66,7 +68,14 @@ def load_predictions(spec):
 
 
 def sequence_identity(rows, csv_path):
-    """{row: identical / aligned residues} over TM-align's alignment."""
+    """{row: identical / aligned residues} over TM-align's alignment.
+
+    Empty when csv_path does not exist, e.g. on a machine without the data:
+    the identity tables are then skipped and everything else is reported.
+    """
+    if not os.path.exists(csv_path):
+        log(f"WARNING: {csv_path} not found; skipping the sequence-identity tables")
+        return {}
     wanted, identity = set(int(r) for r in rows), {}
     for chunk in pd.read_csv(csv_path, usecols=["row", "seqxA", "seqyA"], chunksize=100000,
                              dtype={"seqxA": str, "seqyA": str}, keep_default_na=False):
@@ -132,15 +141,21 @@ def pair_frame(data, identity, name, tm_target="p"):
     for key in ("pair_tm", "pair_tm_pred", "pair_tm2", "pair_tm2_pred"):
         if key in data:
             frame[key[5:]] = data[key]
+    # "tm_ref" bins pairs by TM-score in every figure and table, the same for all models
+    frame["tm_ref"] = np.maximum(frame["tm"], frame["tm2"]) if tm_target == "max" and "tm2" in frame else frame["tm"]
+    note = ""
     if tm_target == "max":
-        if "tm2" in frame:
-            frame["tm"] = np.maximum(frame["tm"], frame["tm2"])
         if "tm2_pred" in frame:
+            frame["tm"] = frame["tm_ref"]
             frame["tm_pred"] = np.maximum(frame["tm_pred"], frame["tm2_pred"])
         elif "tm_pred" in frame:
-            log(f"{name}: predicts only TM_P, so it is left out of the TM-score comparison with --tm-target max")
-            frame = frame.drop(columns=["tm_pred"])
+            # a head that predicts only TM_P is scored against TM_P, and labelled so
+            log(f"{name}: predicts only TM_P, so its TM-score error is against TM_P")
+            note = " vs TM$_P$"
+        else:
+            frame["tm"] = frame["tm_ref"]
     frame["identity"] = frame["row"].map(identity)
+    frame.attrs["tm_note"] = note
     return frame
 
 
@@ -156,15 +171,14 @@ def residue_frame(data, pairs):
         "pred": data["res_pred"], "pis": data["res_pis"],
     })
     lookup = pairs.drop_duplicates("row").set_index("row")
-    if "tm" in lookup:
-        frame["pair_tm"] = frame["row"].map(lookup["tm"])
+    frame["pair_tm"] = frame["row"].map(lookup["tm_ref"])
     frame["identity"] = frame["row"].map(lookup["identity"])
     return frame
 
 
 def tm_tables(tables, models):
     for column, buckets, percent, title, csv in (
-        ("tm", TM_BUCKETS, False, "TM-score error by true TM-score", "tm_by_tm.csv"),
+        ("tm_ref", TM_BUCKETS, False, "TM-score error by true TM-score", "tm_by_tm.csv"),
         ("identity", IDENTITY_BUCKETS, True, "TM-score error by sequence identity", "tm_by_identity.csv"),
     ):
         rows = []
@@ -174,7 +188,8 @@ def tm_tables(tables, models):
             for (low, high), mask in bucket_rows(pairs[column].to_numpy(), buckets):
                 stats = describe(pairs["tm_pred"][mask].to_numpy(), pairs["tm"][mask].to_numpy())
                 if stats:
-                    rows.append({"model": name, "bucket": bucket_label(low, high, percent), **stats})
+                    rows.append({"model": name + pairs.attrs.get("tm_note", "").replace("$", ""),
+                                 "bucket": bucket_label(low, high, percent), **stats})
         if rows:
             tables.table(title, pd.DataFrame(rows), csv)
 
@@ -185,7 +200,7 @@ def tm_tables(tables, models):
         true_fold, pred_fold = pairs["tm"] >= 0.5, pairs["tm_pred"] >= 0.5
         hits = (true_fold & pred_fold).sum()
         rows.append({
-            "model": name, "n": len(pairs),
+            "model": name + pairs.attrs.get("tm_note", "").replace("$", ""), "n": len(pairs),
             "accuracy": float((true_fold == pred_fold).mean()),
             "precision": float(hits / max(pred_fold.sum(), 1)),
             "recall": float(hits / max(true_fold.sum(), 1)),
@@ -229,19 +244,26 @@ def figures(out, models, figures_dir=None):
     def labelled(name, error):
         return f"{name} (MAE {np.mean(np.abs(error)):.3f})"
 
+    # histograms show the percentage of predictions in each bin, not a density
+    def percent(values):
+        return np.full(len(values), 100.0 / len(values))
+
+    share = {"PIS": "% of residue pairs", "TM-score": "% of protein pairs"}
+
     colour_of = {name: COLOURS[k % len(COLOURS)] for k, (name, _, _) in enumerate(models)}
 
     def hist_pair(series, title, path, span):
         fig, axes = plt.subplots(1, 2, figsize=(9, 3.2))
         bins = np.linspace(-span, span, 61)
         abs_bins = np.linspace(0, span, 41)
-        for name, error in series:
+        for name, error, shown in series:
             colour = colour_of[name]
-            axes[0].hist(error, bins=bins, alpha=0.55, color=colour, label=labelled(name, error), density=True)
-            axes[1].hist(np.abs(error), bins=abs_bins, alpha=0.55, color=colour, label=labelled(name, error), density=True)
+            axes[0].hist(error, bins=bins, alpha=0.55, color=colour, label=labelled(shown, error), weights=percent(error))
+            axes[1].hist(np.abs(error), bins=abs_bins, alpha=0.55, color=colour, label=labelled(shown, error),
+                         weights=percent(error))
         axes[0].axvline(0, color="black", lw=0.8, ls="--")
-        axes[0].set(title=f"{title}: error distribution", xlabel="prediction - target", ylabel="density")
-        axes[1].set(title=f"{title}: absolute error", xlabel="|prediction - target|", ylabel="density")
+        axes[0].set(title=f"{title}: error distribution", xlabel="prediction - target", ylabel=share[title])
+        axes[1].set(title=f"{title}: absolute error", xlabel="|prediction - target|", ylabel=share[title])
         for ax in axes:
             ax.legend(frameon=False)
         fig.tight_layout()
@@ -249,26 +271,30 @@ def figures(out, models, figures_dir=None):
         fig.savefig(path.replace(".pdf", ".png"), dpi=200)
         plt.close(fig)
 
-    hist_pair([(n, r["pred"] - r["pis"]) for n, _, r in models if r is not None], "PIS",
-              os.path.join(out, "pis_error_hist.pdf"), 0.6)
-    tm_series = [(n, p["tm_pred"] - p["tm"]) for n, p, _ in models if "tm_pred" in p]
+    # x ranges hold nearly all errors (the MAE in each key still counts every one)
+    PIS_SPAN, TM_SPAN = 0.5, 0.25
+    pis_series = [(n, (r["pred"] - r["pis"]).to_numpy(), n) for n, _, r in models if r is not None]
+    # the TM-score panels compare models on one target; a head scored against TM_P
+    # instead (the teacher's, under --tm-target max) stays in the tables only
+    tm_series = [(n, (p["tm_pred"] - p["tm"]).to_numpy(), n)
+                 for n, p, _ in models if "tm_pred" in p and not p.attrs.get("tm_note")]
+    hist_pair(pis_series, "PIS", os.path.join(out, "pis_error_hist.pdf"), PIS_SPAN)
     if tm_series:
-        hist_pair(tm_series, "TM-score", os.path.join(out, "tm_error_hist.pdf"), 0.5)
+        hist_pair(tm_series, "TM-score", os.path.join(out, "tm_error_hist.pdf"), TM_SPAN)
 
     # the paper's figure: PIS and TM-score error, signed and absolute, MAE in the legends
-    pis_series = [(n, (r["pred"] - r["pis"]).to_numpy()) for n, _, r in models if r is not None]
     fig, axes = plt.subplots(2, 2, figsize=(7.5, 5.2))
-    for row, (title, series, span) in enumerate((("PIS", pis_series, 0.6), ("TM-score", tm_series, 0.5))):
+    for row, (title, series, span) in enumerate((("PIS", pis_series, PIS_SPAN), ("TM-score", tm_series, TM_SPAN))):
         bins, abs_bins = np.linspace(-span, span, 61), np.linspace(0, span, 41)
-        for name, error in series:
+        for name, error, shown in series:
             colour = colour_of[name]
-            axes[row, 0].hist(error, bins=bins, alpha=0.55, color=colour, density=True, label=labelled(name, error))
-            axes[row, 1].hist(np.abs(error), bins=abs_bins, alpha=0.55, color=colour, density=True,
-                              label=labelled(name, error))
+            axes[row, 0].hist(error, bins=bins, alpha=0.55, color=colour, weights=percent(error), label=labelled(shown, error))
+            axes[row, 1].hist(np.abs(error), bins=abs_bins, alpha=0.55, color=colour, weights=percent(error),
+                              label=labelled(shown, error))
         axes[row, 0].axvline(0, color="black", lw=0.8, ls="--")
-        axes[row, 0].set(title=f"({'ac'[row]}) {title}: error", xlabel="prediction $-$ target", ylabel="density")
+        axes[row, 0].set(title=f"({'ac'[row]}) {title}: error", xlabel="prediction $-$ target", ylabel=share[title])
         axes[row, 1].set(title=f"({'bd'[row]}) {title}: absolute error", xlabel="|prediction $-$ target|",
-                         ylabel="density")
+                         ylabel=share[title])
         for ax in axes[row]:
             if series:
                 ax.legend(frameon=False, fontsize=8)
@@ -277,6 +303,25 @@ def figures(out, models, figures_dir=None):
     fig.savefig(os.path.join(out, "error_distributions.png"), dpi=200)
     plt.close(fig)
 
+    # the slides' version: the two signed-error panels only, larger, side by side
+    with plt.rc_context({"font.size": 11}):
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 4.3))
+        for ax, (title, series, span) in zip(axes, (("PIS", pis_series, PIS_SPAN), ("TM-score", tm_series, TM_SPAN))):
+            bins = np.linspace(-span, span, 61)
+            for name, error, shown in series:
+                ax.hist(error, bins=bins, alpha=0.55, color=colour_of[name], weights=percent(error),
+                        label=labelled(shown, error))
+            # the zero line stops below the key (the y-axis gets 35 % headroom below)
+            ax.axvline(0, ymax=0.72, color="black", lw=0.8, ls="--")
+            ax.set(title=f"{title} error", xlabel="prediction $-$ target", ylabel=share[title])
+            if series:
+                # headroom above the bars, and the key on the right where only thin tails are
+                ax.set_ylim(top=ax.get_ylim()[1] * 1.35)
+                ax.legend(frameon=False, fontsize=10, loc="upper right")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out, "error_distributions_slide.pdf"))
+        plt.close(fig)
+
     # error by true TM-score interval, models side by side (the paper's Figure 7)
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
     width = 0.8 / max(len(models), 1)
@@ -284,9 +329,9 @@ def figures(out, models, figures_dir=None):
     for panel, (ax, title) in enumerate(zip(axes, ("TM-score", "PIS of aligned residue pairs"))):
         for k, (name, pairs, residues) in enumerate(models):
             if panel == 0:
-                if "tm_pred" not in pairs:
+                if "tm_pred" not in pairs or pairs.attrs.get("tm_note"):
                     continue
-                values, error = pairs["tm"].to_numpy(), (pairs["tm_pred"] - pairs["tm"]).to_numpy()
+                values, error = pairs["tm_ref"].to_numpy(), (pairs["tm_pred"] - pairs["tm"]).to_numpy()
             else:
                 if residues is None or "pair_tm" not in residues:
                     continue
@@ -336,9 +381,9 @@ def figures(out, models, figures_dir=None):
 
     if figures_dir:
         os.makedirs(figures_dir, exist_ok=True)
-        for name in ("error_distributions.pdf", "error_by_tm.pdf"):
+        for name in ("error_distributions.pdf", "error_by_tm.pdf", "error_distributions_slide.pdf"):
             shutil.copy(os.path.join(out, name), os.path.join(figures_dir, name))
-        log(f"copied error_distributions.pdf and error_by_tm.pdf to {figures_dir}")
+        log(f"copied error_distributions.pdf, error_by_tm.pdf and error_distributions_slide.pdf to {figures_dir}")
 
 
 def main():
