@@ -8,7 +8,8 @@ a.1 the fold, a.1.1 the superfamily and a.1.1.1 the family.
 
 SCOPE_DIR, written by prepare_scope.py:
   scop_lookup.fix.tsv   domain<TAB>sccs, as published
-  structures/<domain>   one PDB-style file per domain, named as in the lookup
+  structures/<domain>   one PDB-style file per domain, named as in the lookup;
+                        an NMR ensemble keeps only its first model
   domains.tsv           one row per domain: labels, length, training overlap
   domains.fasta         each domain's sequence, read from its structure
   hits/                 each method's ranked hits, one file per method
@@ -53,6 +54,18 @@ def load_domains(scope_dir):
         raise SystemExit(f"no {path}; run scope_benchmark/prepare_scope.py first")
     return pd.read_csv(path, sep="\t", keep_default_na=False, na_values=[""],
                        dtype={"domain": str, "sccs": str, "train_hit": str})
+
+
+def has_several_models(path):
+    """Whether a PDB-style file holds more than one model, as NMR ensembles do."""
+    models = 0
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith("MODEL"):
+                models += 1
+                if models > 1:
+                    return True
+    return False
 
 
 def read_fasta(path):

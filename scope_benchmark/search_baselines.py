@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from scope40 import FASTA, HITS, SCOPE_DIR, STRUCTURES, load_domains  # noqa: E402
+from scope40 import FASTA, HITS, SCOPE_DIR, STRUCTURES, has_several_models, load_domains  # noqa: E402
 from common import log  # noqa: E402
 from evaluate_search import evaluate, print_table, query_set  # noqa: E402
 
@@ -60,6 +60,13 @@ def main():
 
     jobs = {}
     if args.foldseek:
+        structures = os.path.join(args.dir, STRUCTURES)
+        ensembles = [name for name in sorted(os.listdir(structures))
+                     if has_several_models(os.path.join(structures, name))]
+        if ensembles:
+            raise SystemExit(f"{len(ensembles):,} structures hold several models (e.g. {ensembles[0]}), and "
+                             f"Foldseek would search each as a domain of its own; rerun prepare_scope.py, "
+                             f"which keeps the first")
         jobs["foldseek"] = [args.foldseek, "easy-search", os.path.join(args.dir, STRUCTURES),
                             os.path.join(args.dir, STRUCTURES), None, None,
                             "-s", "9.5", "--max-seqs", "2000", "-e", "10", *threads]

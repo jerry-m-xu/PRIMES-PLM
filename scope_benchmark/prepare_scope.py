@@ -10,7 +10,9 @@ Each step is skipped when its output exists; --force redoes them all.
    PDB-style files of the 2.01 40 % subset (about 800 MB), and extract the
    lookup's domains to structures/. SCOPe names 51 multi-chain domains g...,
    which the lookup renames d...; every file takes the lookup's name, with no
-   extension, as in the benchmark.
+   extension, as in the benchmark. An NMR file keeps only its first model:
+   about one domain in eight is an ensemble of 10-20 models, and Foldseek
+   would search each model as an entry of its own (<domain>_MODEL_<n>).
 2. Read each domain's sequence and C-alpha count: the first model, every chain
    in file order (a multi-chain domain keeps all its chains), and every amino
    acid with a CA atom, modified ones as their parent (selenomethionine as M).
@@ -41,7 +43,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from scope40 import (  # noqa: E402
-    FASTA, LOOKUP, LOOKUP_URL, SCOPE_DIR, STRUCTURES, STRUCTURES_URL, TABLE, levels, read_fasta,
+    FASTA, LOOKUP, LOOKUP_URL, SCOPE_DIR, STRUCTURES, STRUCTURES_URL, TABLE, has_several_models, levels,
+    read_fasta,
 )
 from common import log  # noqa: E402
 
@@ -92,6 +95,19 @@ def extract_structures(archive, lookup, directory):
                 shutil.copyfileobj(source, target)
             written.add(domain)
     return [domain for domain in lookup if domain not in written]
+
+
+def keep_first_model(path):
+    """Cut a multi-model file down to its first model, in place."""
+    with open(path) as handle:
+        lines = handle.readlines()
+    starts = [k for k, line in enumerate(lines) if line.startswith("MODEL")]
+    ends = [k for k, line in enumerate(lines) if line.startswith("ENDMDL")]
+    # the header, model 1 up to its ENDMDL, and the records after the last model (MASTER, END)
+    tail = ends[-1] + 1 if ends else len(lines)
+    with open(path + ".part", "w") as handle:
+        handle.writelines(lines[:starts[1]] + lines[tail:])
+    os.replace(path + ".part", path)
 
 
 def read_domain(path):
@@ -197,6 +213,13 @@ def main():
             log(f"WARNING: {len(missing)} domains not in the archive, e.g. {missing[:5]}")
         if not args.keep_archive:
             os.remove(archive)
+    # every time, so that an earlier preparation is brought up to date
+    ensembles = [domain for domain in lookup if os.path.exists(os.path.join(structures, domain))
+                 and has_several_models(os.path.join(structures, domain))]
+    for domain in ensembles:
+        keep_first_model(os.path.join(structures, domain))
+    if ensembles:
+        log(f"kept the first model of {len(ensembles):,} multi-model (NMR) structures")
 
     # 2. sequences from the structures
     if os.path.exists(fasta_path):
