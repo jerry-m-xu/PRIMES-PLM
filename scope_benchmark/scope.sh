@@ -6,13 +6,16 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=scope40_%j.out
 #
-# The SCOPe40 benchmark as batch jobs. Submit from the repository root:
+# The SCOPe40 benchmark as batch jobs. Submit from the repository root, with
+# the steps to run as the argument:
 #
-#   STEP=prepare,baselines sbatch scope_benchmark/scope.sh
-#   STEP=student sbatch -p GPU-shared --gpus=v100-32:1 --cpus-per-task=5 scope_benchmark/scope.sh
-#   STEP=evaluate sbatch scope_benchmark/scope.sh
+#   sbatch scope_benchmark/scope.sh prepare,baselines
+#   sbatch -p GPU-shared --gpus=v100-32:1 --cpus-per-task=5 scope_benchmark/scope.sh student
+#   sbatch scope_benchmark/scope.sh evaluate
 #
-# STEP is one step or a comma-separated list, run in order:
+# There is no default step, so a job submitted without one fails at once
+# instead of running something else. The steps, one or a comma-separated
+# list, run in order:
 #   prepare     prepare_scope.py, with the training-overlap check
 #   baselines   search_baselines.py, Foldseek and MMseqs2
 #   student     search_student.py; needs a GPU, so override the partition as above
@@ -27,7 +30,12 @@
 
 set -euo pipefail
 
-STEP="${STEP:-baselines}"
+# the argument, or STEP exported in the environment
+STEP="${1:-${STEP:-}}"
+if [ -z "$STEP" ]; then
+    echo "no step given: sbatch scope_benchmark/scope.sh <prepare|baselines|student|evaluate>" >&2
+    exit 1
+fi
 OCEAN=/jet/home/jxu23/OCEANDIR
 SCOPE_DIR="$OCEAN/scope40"
 FOLDSEEK="${FOLDSEEK:-$HOME/tools/foldseek/bin/foldseek}"
