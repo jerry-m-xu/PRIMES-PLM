@@ -44,11 +44,10 @@ if HERE not in sys.path:
 
 from scope40 import (  # noqa: E402
     FASTA, LOOKUP, LOOKUP_URL, SCOPE_DIR, STRUCTURES, STRUCTURES_URL, TABLE, has_several_models, levels,
-    read_fasta,
+    read_domain, read_fasta,
 )
 from common import log  # noqa: E402
 
-AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
 OVERLAP_EVALUE = 1e-3
 OVERLAP_MIN_COVERAGE = 0.5  # of the domain
 
@@ -108,27 +107,6 @@ def keep_first_model(path):
     with open(path + ".part", "w") as handle:
         handle.writelines(lines[:starts[1]] + lines[tail:])
     os.replace(path + ".part", path)
-
-
-def read_domain(path):
-    """(sequence, chain count) over every chain of the first model."""
-    from Bio.Data.PDBData import protein_letters_3to1_extended
-    from Bio.PDB import PDBParser
-
-    models = list(PDBParser(QUIET=True).get_structure("domain", path))
-    if not models:
-        return "", 0
-    sequence, chains = [], 0
-    for chain in models[0]:
-        before = len(sequence)
-        for residue in chain:
-            if "CA" not in residue:
-                continue
-            letter = protein_letters_3to1_extended.get(residue.resname)
-            if letter in AMINO_ACIDS:
-                sequence.append(letter)
-        chains += len(sequence) > before
-    return "".join(sequence), chains
 
 
 def training_fasta(path):
@@ -232,7 +210,7 @@ def main():
             if not os.path.exists(path):
                 continue
             try:
-                sequence, n_chains = read_domain(path)
+                sequence, _, n_chains = read_domain(path)
             except Exception as error:  # one unreadable file should not end the run
                 log(f"WARNING: cannot read {domain} ({error}); left out")
                 continue

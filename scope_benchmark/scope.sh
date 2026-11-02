@@ -23,10 +23,14 @@
 #   align       align_rerank.py, after student; also on a GPU, and needs numba
 #               in the environment (pip install numba)
 #   evaluate    evaluate_search.py on every hit file, all queries and below MAX_ID
+#   diagnose    after evaluate, on the held-out queries: candidate_recall.py on the
+#               lists align re-ranks, and paired_bootstrap.py's comparisons
 #
 # Settings, through the environment:
 #   FOLDSEEK, MMSEQS   binaries (default $HOME/tools/<name>/bin/<name>)
 #   CHECKPOINT         student checkpoint (default the dense_650M run's student_best.pt)
+#   TEACHER            teacher checkpoint align also aligns with (default teacher_best.pt;
+#                      TEACHER= leaves the teacher out)
 #   NAME               prefix of the student's hit files (default student)
 #   MAX_ID             training-identity cut for the held-out queries (default 0.3)
 
@@ -35,7 +39,7 @@ set -euo pipefail
 # the argument, or STEP exported in the environment
 STEP="${1:-${STEP:-}}"
 if [ -z "$STEP" ]; then
-    echo "no step given: sbatch scope_benchmark/scope.sh <prepare|baselines|student|align|evaluate>" >&2
+    echo "no step given: sbatch scope_benchmark/scope.sh <prepare|baselines|student|align|evaluate|diagnose>" >&2
     exit 1
 fi
 OCEAN=/jet/home/jxu23/OCEANDIR
@@ -43,6 +47,7 @@ SCOPE_DIR="$OCEAN/scope40"
 FOLDSEEK="${FOLDSEEK:-$HOME/tools/foldseek/bin/foldseek}"
 MMSEQS="${MMSEQS:-$HOME/tools/mmseqs/bin/mmseqs}"
 CHECKPOINT="${CHECKPOINT:-$OCEAN/student_checkpoints_dense_650M/student_best.pt}"
+TEACHER="${TEACHER-$OCEAN/teacher_checkpoints/teacher_best.pt}"
 NAME="${NAME:-student}"
 MAX_ID="${MAX_ID:-0.3}"
 THREADS="${SLURM_CPUS_PER_TASK:-8}"
@@ -99,9 +104,14 @@ for step in ${STEP//,/ }; do
                 exit 1
             fi
             script=search_student.py
-            [ "$step" = align ] && script=align_rerank.py
+            extra=()
+            if [ "$step" = align ]; then
+                script=align_rerank.py
+                [ -n "$TEACHER" ] && extra=(--teacher "$TEACHER")
+            fi
             run python -u "$REPO_DIR/scope_benchmark/$script" --dir "$SCOPE_DIR" \
-                --checkpoint "$CHECKPOINT" --name "$NAME" --max-train-identity "$MAX_ID" ;;
+                --checkpoint "$CHECKPOINT" --name "$NAME" --max-train-identity "$MAX_ID" \
+                ${extra[@]+"${extra[@]}"} ;;
         evaluate)
             shopt -s nullglob
             hits=("$SCOPE_DIR"/hits/*.m8 "$SCOPE_DIR"/hits/*.tsv.gz)
@@ -114,8 +124,14 @@ for step in ${STEP//,/ }; do
                 --per-query "$SCOPE_DIR/per_query_all.tsv"
             run python -u "$REPO_DIR/scope_benchmark/evaluate_search.py" --dir "$SCOPE_DIR" "${hits[@]}" \
                 --max-train-identity "$MAX_ID" --per-query "$SCOPE_DIR/per_query_heldout.tsv" ;;
+        diagnose)
+            run python -u "$REPO_DIR/scope_benchmark/candidate_recall.py" --dir "$SCOPE_DIR" \
+                --max-train-identity "$MAX_ID" --union \
+                "$SCOPE_DIR/hits/${NAME}_tm.tsv.gz" "$SCOPE_DIR"/hits/esm2_*_pooled.tsv.gz
+            run python -u "$REPO_DIR/scope_benchmark/paired_bootstrap.py" \
+                "$SCOPE_DIR/per_query_heldout.tsv" --name "$NAME" ;;
         *)
-            echo "unknown step '$step' (prepare, baselines, student, align or evaluate)" >&2
+            echo "unknown step '$step' (prepare, baselines, student, align, evaluate or diagnose)" >&2
             exit 1 ;;
     esac
 done

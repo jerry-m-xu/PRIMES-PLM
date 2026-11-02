@@ -2,6 +2,7 @@
 """Re-rank SCOPe40 hits by aligning residue similarity matrices.
 
     python scope_benchmark/align_rerank.py --checkpoint $D/student_checkpoints_dense_650M/student_best.pt
+    python scope_benchmark/align_rerank.py --checkpoint ... --teacher $D/teacher_checkpoints/teacher_best.pt
 
 Run after search_student.py, on a GPU node, with numba installed (pip install
 numba). The student's tm score and pooled cosine ignore the order of
@@ -17,6 +18,14 @@ over BLOSUM62:
                     the same method without the student
   <name>_esm2_sw    the average of the two matrices, on the student's tm hits
   <name>_sw_tm      <name>_sw blended with the tm score
+  esm2_<model>_sw_on_<name>
+                    ESM-2's residue cosines on the student's tm hits: against
+                    esm2_<model>_sw it shows what the candidate list is worth,
+                    against <name>_sw and <name>_esm2_sw what the matrices are
+  teacher_sw_on_<name>
+                    with --teacher, the teacher's residue cosines, from the
+                    structures (teacher_residues.py), on the student's tm hits:
+                    the ceiling for what the student could learn from it
 
 Each pair's matrix is standardised, every entry by its row and by its column
 (the mean of the two z-scores), so one set of alignment settings suits either
@@ -31,8 +40,8 @@ Each output file, hits/<variant>.tsv.gz, lists a query's re-ranked hits first
 and then the rest of its original list in the original order; the score
 column holds the alignment score for the first and the original score after.
 ESM-2's residue embeddings (about 5 GB in float16) are cached in
-hits/esm2_<model>_residues.pt, and the chosen settings are written to
-hits/<name>_align_params.json.
+hits/esm2_<model>_residues.pt, the teacher's in hits/teacher_residues.pt, and
+the chosen settings are written to hits/<name>_align_params.json.
 """
 
 import argparse
@@ -55,6 +64,7 @@ from scope40 import FASTA, HITS, SCOPE_DIR, load_domains, read_fasta  # noqa: E4
 from common import ESM_MODELS, log  # noqa: E402
 from evaluate_search import eligible_queries, evaluate, print_table, query_set  # noqa: E402
 from search_student import cached_embeddings, embed, esm_features, load_student  # noqa: E402
+from teacher_residues import teacher_residues  # noqa: E402
 
 try:
     import numba
@@ -247,6 +257,7 @@ def write_ranked(handle, ranked, query, scores, names):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", required=True, help="the student search_student.py ran")
+    parser.add_argument("--teacher", default=None, help="teacher checkpoint; adds teacher_sw_on_<name>")
     parser.add_argument("--dir", default=SCOPE_DIR)
     parser.add_argument("--name", default="student", help="search_student.py's --name")
     parser.add_argument("--top", type=int, default=500, help="hits re-ranked per query")
@@ -284,6 +295,14 @@ def main():
     del embeddings
     residues["esm2"] = Residues(esm_residues(os.path.join(hits_dir, f"esm2_{tag}_residues.pt"),
                                              tag, domains, sequences, device), device)
+    if args.teacher:
+        residues["teacher"] = Residues(teacher_residues(os.path.join(hits_dir, "teacher_residues.pt"),
+                                                        args.teacher, args.dir, domains, sequences, device),
+                                       device)
+    # the matrices on the student's candidates share its blocks, so every domain needs one length throughout
+    for source, embedded in residues.items():
+        if not torch.equal(embedded.lengths, residues["student"].lengths):
+            raise SystemExit(f"the {source} residues do not match the student's in length")
     ranked = {source: Ranked(path, index) for source, path in sources.items()}
     log(f"embeddings and hit lists loaded in {time.perf_counter() - start:.0f} s; "
         f"numba on {numba.get_num_threads()} threads")
@@ -291,7 +310,10 @@ def main():
     # variant: (the hit list it re-ranks, output name)
     variants = {"student": ("student", f"{args.name}_sw"),
                 "esm2": ("esm2", f"esm2_{tag}_sw"),
-                "mixed": ("student", f"{args.name}_esm2_sw")}
+                "mixed": ("student", f"{args.name}_esm2_sw"),
+                "esm2_same": ("student", f"esm2_{tag}_sw_on_{args.name}")}
+    if args.teacher:
+        variants["teacher"] = ("student", f"teacher_sw_on_{args.name}")
     blend_name = f"{args.name}_sw_tm"
 
     def matrices(query):
@@ -302,9 +324,14 @@ def main():
         esm_z = standardise(residues["esm2"].similarity(query, targets)[0], starts, lengths)
         targets_esm, _ = ranked["esm2"].top(query, args.top)
         S, starts_esm, lengths_esm = residues["esm2"].similarity(query, targets_esm)
-        return {"student": (student_z, starts, lengths),
-                "esm2": (standardise(S, starts_esm, lengths_esm), starts_esm, lengths_esm),
-                "mixed": (0.5 * (student_z + esm_z), starts, lengths)}
+        out = {"student": (student_z, starts, lengths),
+               "esm2": (standardise(S, starts_esm, lengths_esm), starts_esm, lengths_esm),
+               "mixed": (0.5 * (student_z + esm_z), starts, lengths),
+               "esm2_same": (esm_z, starts, lengths)}
+        if "teacher" in residues:
+            out["teacher"] = (standardise(residues["teacher"].similarity(query, targets)[0], starts, lengths),
+                              starts, lengths)
+        return out
 
     # 1. choose the settings on queries with a close training homologue
     _, eligible = eligible_queries(indexed)
@@ -389,7 +416,7 @@ def main():
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "threads": numba.get_num_threads(), "top": args.top, "queries": len(queries),
         "tune_s": tune_seconds, "rerank_s": rerank_seconds,
-        "note": "rerank_s covers all four variants, matrices included",
+        "note": "rerank_s covers every variant, matrices included",
     }
     with open(timing_path, "w") as handle:
         json.dump(timing, handle, indent=2)

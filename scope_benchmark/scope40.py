@@ -38,6 +38,8 @@ TABLE = "domains.tsv"
 FASTA = "domains.fasta"
 HITS = "hits"
 
+AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWY")
+
 
 def levels(sccs):
     """(family, superfamily, fold, class) of an sccs such as a.1.1.1."""
@@ -66,6 +68,31 @@ def has_several_models(path):
                 if models > 1:
                     return True
     return False
+
+
+def read_domain(path):
+    """(sequence, C-alpha coordinates [L, 3] float32, chain count) over every chain of the first model.
+
+    Every amino acid with a CA atom counts, modified ones as their parent
+    (selenomethionine as M); prepare_scope.py's notes say why.
+    """
+    import numpy as np
+    from Bio.Data.PDBData import protein_letters_3to1_extended
+    from Bio.PDB import PDBParser
+
+    models = list(PDBParser(QUIET=True).get_structure("domain", path))
+    sequence, coords, chains = [], [], 0
+    for chain in models[0] if models else []:
+        before = len(sequence)
+        for residue in chain:
+            if "CA" not in residue:
+                continue
+            letter = protein_letters_3to1_extended.get(residue.resname)
+            if letter in AMINO_ACIDS:
+                sequence.append(letter)
+                coords.append(residue["CA"].coord)
+        chains += len(sequence) > before
+    return "".join(sequence), np.asarray(coords, dtype=np.float32).reshape(-1, 3), chains
 
 
 def read_fasta(path):
